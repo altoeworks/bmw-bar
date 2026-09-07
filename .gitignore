@@ -1,0 +1,29 @@
+# Swift Package Manager
+.build/
+.swiftpm/
+*.o
+*.swiftmodule
+
+# App bundle produced by `make app` / `make run`
+build/
+
+# Xcode, in case anyone opens the package there
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+DerivedData/
+
+# macOS
+.DS_Store
+
+# Claude Code: settings.local.json is per-machine permission state, not project config
+.claude/settings.local.json
+
+# Never committed here, but guard against a local experiment landing in the repo by
+# accident — real tokens, VIN, and cached vehicle state belong only in
+# ~/Library/Application Support/bmw-bar, never inside the checkout.
+tokens.json
+config.json
+quota.json
+state.json
+history/samples.jsonl
