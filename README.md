@@ -6,9 +6,11 @@ Shows charge level, charging status, power, time remaining, charge limit, electr
 range and plug state — updating live over BMW's MQTT stream.
 
 **Idle**
+
 ![image](./panel.png)
 
 **Charging**
+
 ![image](./panel-charging.png)
 
 ## What this can and cannot do
