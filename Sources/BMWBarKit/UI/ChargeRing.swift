@@ -17,6 +17,9 @@ struct ChargeRing: View {
     /// reading's age are visible without opening a panel.
     var reportedPercent: Double?
     var reportedAt: Date?
+    /// Whether the app was listening when this was reported. An unconfirmed reading is
+    /// still the last thing the car said — it just cannot be promised to be current.
+    var confidence: Confidence = .confirmed
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -123,7 +126,7 @@ struct ChargeRing: View {
             Text(text)
                 .font(.system(size: 9, weight: .medium, design: .rounded))
                 .monospacedDigit()
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(confidence == .confirmed ? AnyShapeStyle(.tertiary) : AnyShapeStyle(Color.orange))
                 .lineLimit(1)
                 .minimumScaleFactor(0.7)
         }
@@ -131,6 +134,11 @@ struct ChargeRing: View {
 
     private var provenanceText: String? {
         let age = reportedAt.map { Self.age(of: $0) }
+        // An estimate extrapolates from a reading we trust. Across a gap there is nothing
+        // to extrapolate from, so the honest thing is to date the reading and stop there.
+        guard confidence == .confirmed else {
+            return age.map { "last heard \($0)" } ?? "not heard from"
+        }
         guard isEstimated, let reported = reportedPercent else {
             return age.map { "reported \($0)" }
         }
@@ -138,14 +146,10 @@ struct ChargeRing: View {
         return age.map { "was \(reportedText) · \($0)" } ?? "was \(reportedText)"
     }
 
-    /// Compact enough to fit inside the ring.
+    /// Compact enough to fit inside the ring. Shared with the detail panels' freshness
+    /// lines so one reading is never described two different ways in one window.
     static func age(of date: Date, now: Date = Date()) -> String {
-        let seconds = max(0, now.timeIntervalSince(date))
-        if seconds < 90 { return "just now" }
-        let minutes = Int(seconds / 60)
-        if minutes < 60 { return "\(minutes)m ago" }
-        let hours = minutes / 60
-        return hours < 24 ? "\(hours)h ago" : "\(hours / 24)d ago"
+        Freshness.age(of: date, now: now)
     }
 
     // MARK: - Motion
@@ -179,6 +183,7 @@ struct ChargeRing: View {
             text += ", last reported \(Int(reported.rounded())) percent"
         }
         if let reportedAt { text += " \(Self.age(of: reportedAt))" }
+        if confidence == .unconfirmed { text += ", unconfirmed since the app lost touch" }
         if let limitPercent { text += ", limit \(Int(limitPercent.rounded())) percent" }
         return text
     }

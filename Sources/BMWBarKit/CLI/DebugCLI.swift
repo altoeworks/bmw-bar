@@ -1,4 +1,5 @@
 import AppKit
+import CocoaMQTT
 import Foundation
 import SwiftUI
 
@@ -37,6 +38,7 @@ public enum DebugCLI {
             case "quota": try await quota()
             case "containers": try await containers(args)
             case "stream": try await stream(args)
+            case "session-test": try await sessionTest(args)
             case "notify-test": try await notifyTest()
             case "mood": try mood(args)
             case "render": try await render(args)
@@ -248,6 +250,182 @@ public enum DebugCLI {
 
     /// Subscribes to the live MQTT feed and prints messages as they arrive.
     /// Costs no API quota — this is the intended way to follow the car.
+    /// Does BMW's broker hold a session for us while we are away?
+    ///
+    /// Nothing in BMW's documentation says, and none of the community bridges
+    /// investigated it — but the answer decides whether an overnight sleep loses
+    /// everything the car published or replays it on reconnect. So it is measured rather
+    /// than assumed.
+    ///
+    /// Connect persistent, disconnect cleanly, make the car publish something, reconnect.
+    /// A pass needs both halves: the broker must report the session as still present
+    /// (`sp: true`), and the message published while we were gone must actually arrive.
+    /// Costs no REST calls.
+    /// Surfaces CocoaMQTT's CONNACK line and nothing else.
+    ///
+    /// `sessPresent` is the single fact this test turns on, and it lives on CocoaMQTT's
+    /// internal `FrameConnAck` — not on the decoded object our delegate receives — so its
+    /// own log line is the only way to read it. Turning the library's debug level up
+    /// wholesale is not an option: it dumps every CONNECT packet byte by byte, and that
+    /// payload *is* the `id_token`. So the level goes up and this filter throws away
+    /// everything but the one line worth having.
+    private final class ConnAckLogger: CocoaMQTTLogger, @unchecked Sendable {
+        /// Set on the main actor before the test runs and read after it; the library
+        /// calls `log` from its own queue.
+        nonisolated(unsafe) static var lines: [String] = []
+        private static let lock = NSLock()
+
+        static func record(_ line: String) {
+            lock.lock()
+            defer { lock.unlock() }
+            lines.append(line)
+        }
+
+        static func drain() -> [String] {
+            lock.lock()
+            defer { lock.unlock() }
+            return lines
+        }
+
+        override func log(level: CocoaMQTTLoggerLevel, message: String) {
+            guard message.contains("CONNACK") else { return }
+            Self.record(message)
+            print("  · \(message)")
+        }
+    }
+
+    private static func sessionTest(_ args: [String]) async throws {
+        let session = try Session.make()
+        let gap = value(of: "--gap", in: args).flatMap(Double.init) ?? 120
+        let listen = value(of: "--listen", in: args).flatMap(Double.init) ?? 60
+        let config = Config.load()
+        let clientID = Config.resolvedStreamClientID()
+
+        ConnAckLogger.lines = []
+        let logger = ConnAckLogger()
+        logger.minLevel = .debug
+        CocoaMQTTLogger.logger = logger
+        defer { CocoaMQTTLogger.logger = CocoaMQTTLogger() }
+
+        let stream = CarDataStream(
+            tokens: session.tokens,
+            vin: config.vin,
+            mode: .persistent(clientID: clientID, expiry: CarDataStream.sessionExpiry)
+        )
+        stream.onStatusChange = { status in
+            FileHandle.standardError.write(Data("[\(status.summary)]\n".utf8))
+        }
+        stream.onPersistentSessionVerdict = { supported in
+            FileHandle.standardError.write(
+                Data("[broker \(supported ? "accepted" : "refused") a persistent session]\n".utf8)
+            )
+        }
+
+        print("""
+
+        Persistent session test
+          client id: \(clientID)
+          topic:     <gcid>/\(config.vin ?? "+")
+
+        A reconnect that reports `sp: true` means the broker kept our session — and with
+        it the subscription that queues QoS 1 messages while we are away.
+        """)
+
+        let messages = stream.messages()
+        let collector = MessageCollector()
+        let pump = Task {
+            for await message in messages {
+                await collector.record(message)
+                let stamp = time.string(from: message.sentAt ?? Date())
+                print("  ← \(stamp)  \(message.data.count) descriptor(s)")
+            }
+        }
+        defer {
+            pump.cancel()
+            stream.stop()
+        }
+
+        print("\n[1/3] Connecting (expect sp: false on a first run)…")
+        stream.start()
+        try await Task.sleep(nanoseconds: 15 * 1_000_000_000)
+
+        let disconnectedAt = Date()
+        print("""
+
+        [2/3] Disconnecting for \(Int(gap))s.
+              Lock or unlock the car from the MyBMW app NOW — that is the event whose
+              delivery decides this test.
+        """)
+        stream.pause()
+        try await Task.sleep(nanoseconds: UInt64(gap * 1_000_000_000))
+
+        await collector.mark()
+        let reconnectedAt = Date()
+        print("\n[3/3] Reconnecting (expect sp: true if the session survived)…")
+        stream.resume()
+        try await Task.sleep(nanoseconds: UInt64(listen * 1_000_000_000))
+
+        // The broker echoes `sp: true` when it still had our session — which is the fact
+        // that decides whether anything could have been queued for us at all.
+        let resumed = ConnAckLogger.drain().dropFirst().contains { $0.contains("sp: true") }
+        let afterReconnect = await collector.sinceMark
+        // A replayed message was published while we were disconnected; a merely fresh one
+        // was published after we came back. Only the first proves queueing.
+        let replayed = afterReconnect.filter { message in
+            guard let sentAt = message.sentAt else { return false }
+            return sentAt > disconnectedAt && sentAt < reconnectedAt
+        }
+
+        print("""
+
+        Result
+          CONNACKs seen:            \(ConnAckLogger.drain().joined(separator: " | "))
+          session present on retry: \(resumed ? "yes" : "no")
+          messages after reconnect: \(afterReconnect.count)
+          published while away:     \(replayed.count)
+          session mode in use:      \(stream.sessionMode.isPersistent ? "persistent" : "clean (downgraded)")
+
+        \(verdict(replayed: replayed.count, total: afterReconnect.count, resumed: resumed, persistent: stream.sessionMode.isPersistent))
+        """)
+    }
+
+    private static func verdict(replayed: Int, total: Int, resumed: Bool, persistent: Bool) -> String {
+        if !persistent {
+            return "FAIL — BMW refused a persistent session; the app will use clean sessions."
+        }
+        if !resumed {
+            return """
+            FAIL — the broker accepted the connection but did not keep the session
+            (sp: false on reconnect), so nothing was held for us while we were away.
+            """
+        }
+        if replayed > 0 {
+            return "PASS — the broker queued \(replayed) message(s) while we were away and replayed them."
+        }
+        if total > 0 {
+            return """
+            INCONCLUSIVE — messages arrived but all were published after reconnecting.
+            Either the car said nothing during the gap, or the broker did not queue it.
+            Re-run and make sure the car actually publishes while disconnected.
+            """
+        }
+        return """
+        PARTIAL — the session survived (sp: true), so the subscription was held for us,
+        but the car published nothing during the gap so replay itself went untested.
+        Re-run and lock/unlock the car while disconnected to confirm end to end.
+        """
+    }
+
+    /// Collects streamed messages off the stream's own queue.
+    private actor MessageCollector {
+        private var messages: [StreamMessage] = []
+        private var markIndex = 0
+
+        func record(_ message: StreamMessage) { messages.append(message) }
+        func mark() { markIndex = messages.count }
+        var sinceMark: [StreamMessage] { Array(messages.dropFirst(markIndex)) }
+    }
+
     private static func stream(_ args: [String]) async throws {
         let session = try Session.make()
         let asJSON = args.contains("--json")
@@ -413,7 +591,8 @@ public enum DebugCLI {
             throw CLIError.notificationsUnavailable("unknown --detail; expected one of: \(known)")
         }
 
-        let model = AppModel(previewValues: values, samples: samples)
+        let gap = value(of: "--gap", in: args).flatMap(Double.init).map { $0 * 3600 }
+        let model = AppModel(previewValues: values, samples: samples, previewGap: gap)
         let renderer = ImageRenderer(content: StatusPanel(model: model, initialDetail: detail)
             .background(Color(nsColor: .windowBackgroundColor)))
         renderer.scale = 2
@@ -514,9 +693,12 @@ public enum DebugCLI {
           setup [--refresh]                   Resolve the VIN and telemetry container
           status [--json]                     One REST snapshot of the car (1 API call)
           stream [--json] [--seconds <n>]     Follow the live MQTT feed (no quota cost)
+          session-test [--gap <s>]            Does BMW queue messages while we're away?
+                       [--listen <s>]         (no quota cost; lock the car during the gap)
           notify-test                         Post a sample notification (bundled app only)
           mood [state]                        Show the colour + motion for each state
           render [--charging|--empty]         Render the panel to an image (no network)
+                 [--gap <hours>]                …staged as if the Mac had been away
                  [--detail <name>] out.png    …or one detail panel: body, tyres, charging,
                                               security, location, climate, trip
           quota                               Show today's API budget (offline)

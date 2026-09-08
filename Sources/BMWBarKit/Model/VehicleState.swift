@@ -227,6 +227,19 @@ public final class VehicleState {
     public var newestReadingTimestamp: Date? {
         values.values.compactMap(\.timestamp).max()
     }
+
+    /// When the car measured one particular thing.
+    public func reportedAt(_ descriptor: String) -> Date? { self[descriptor]?.timestamp }
+
+    /// The newest reading among a group of descriptors.
+    ///
+    /// There is no single "age of the data": each descriptor carries its own timestamp
+    /// and they drift far apart — a real cache held location from the previous evening
+    /// alongside seventy values from that morning. So freshness is answered per group of
+    /// related facts, which is the granularity a panel actually shows.
+    public func newestTimestamp(among descriptors: [String]) -> Date? {
+        descriptors.compactMap { self[$0]?.timestamp }.max()
+    }
 }
 
 // MARK: - Openings, security, tyres, location, climate

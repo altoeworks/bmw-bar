@@ -71,6 +71,9 @@ public final class AppModel {
     /// so quietly instead of raising it as a failure.
     public private(set) var pollingBlockedReason: String?
     public private(set) var notifier = ChargingNotifier()
+    /// What the app was in a position to hear, and when it was not. This is what lets the
+    /// panel tell "the car is quiet" apart from "we were asleep".
+    public let coverage: CoverageTracker
 
     private var session: Session?
     private var stream: CarDataStream?
@@ -80,6 +83,14 @@ public final class AppModel {
     private var pollTask: Task<Void, Never>?
     private var estimateTask: Task<Void, Never>?
     private var saveTask: Task<Void, Never>?
+    private var heartbeatTask: Task<Void, Never>?
+    private var resyncTask: Task<Void, Never>?
+    private var backlogTask: Task<Void, Never>?
+    private let systemWatcher = SystemWatcher()
+    /// Resyncs spent today, held in memory: the daily cap is a courtesy limit and
+    /// `QuotaTracker`'s reserve is the real backstop.
+    private var resyncsToday = 0
+    private var resyncDay = ""
     /// Plenty for the 24 h sparkline and recent sessions, while keeping the in-memory
     /// array bounded no matter how long the 90-day log grows.
     nonisolated static let samplesKeptInMemory = 5_000
@@ -93,6 +104,7 @@ public final class AppModel {
     private let launchedAt = Date()
 
     public init() {
+        coverage = CoverageTracker()
         let config = Config.load()
         notifications = config.notificationPreferences
         polling = config.pollingPreferences
@@ -100,12 +112,21 @@ public final class AppModel {
 
     /// A ready-to-render model with synthetic state and no network, for rendering the
     /// panel to an image (`--cli render`) and for previews. Nothing here connects.
+    /// - Parameter previewGap: stages an unresolved coverage gap, so the states that only
+    ///   appear after the Mac has been away can be rendered without waiting for a real one.
     public init(
         previewValues: [String: TelematicValue],
         vehicleName: String? = "BMW i4 eDrive35",
         samples: [Sample] = [],
-        streamStatus: CarDataStream.Status = .connected
+        streamStatus: CarDataStream.Status = .connected,
+        previewGap: TimeInterval? = nil
     ) {
+        // Without a staged gap the preview is meant to look healthy, so coverage reaches
+        // back far enough to vouch for the sample values.
+        coverage = CoverageTracker(
+            store: .ephemeral,
+            now: Date().addingTimeInterval(previewGap == nil ? -30 * 24 * 3600 : 0)
+        )
         notifications = .default
         vehicle.vehicleName = vehicleName
         vehicle.merge(previewValues)
@@ -115,6 +136,11 @@ public final class AppModel {
         phase = .ready
         displayChargePercent = vehicle.displayChargePercent()
         isChargeEstimated = vehicle.isChargeEstimated()
+        let now = Date()
+        if let previewGap {
+            coverage.endListening(cause: .sleep, at: now.addingTimeInterval(-previewGap))
+            coverage.beginListening(at: now)
+        }
     }
 
     // MARK: - Lifecycle
@@ -173,6 +199,7 @@ public final class AppModel {
 
     public func signOut() async {
         stopStream()
+        stopAmbientWork()
         try? FileTokenStorage().clear()
         try? KeychainTokenStorage().clear()
         stateStore.clear()
@@ -212,6 +239,11 @@ public final class AppModel {
                 stateStore.save(vehicle.values)
                 // A snapshot counts as hearing from the car, so the idle clock restarts.
                 lastStreamMessageAt = Date()
+                // The hole has been answered as far as a snapshot can answer it. Which
+                // descriptors it actually refreshed is left to speak for itself: each
+                // carries BMW's own timestamp, so anything the container does not cover
+                // simply stays unconfirmed.
+                coverage.resolveGap()
             }
         } catch {
             if automatic {
@@ -240,6 +272,123 @@ public final class AppModel {
                 try? await Task.sleep(nanoseconds: 30_000_000_000)
                 guard !Task.isCancelled, let self else { return }
                 self.refreshEstimate()
+            }
+        }
+    }
+
+    // MARK: - Coverage, sleep and wake
+
+    /// A message this old was published before we reconnected, so it is the broker
+    /// replaying a backlog rather than the car speaking now.
+    static let backlogThreshold: TimeInterval = 2 * 60
+    /// How long the backlog is allowed to keep arriving before it is considered settled.
+    static let backlogSettle: TimeInterval = 3
+    /// How long to wait after a wake for the broker to replay, before concluding it will
+    /// not and spending a call instead.
+    static let resyncGrace: TimeInterval = 45
+
+    public func isBacklog(_ message: StreamMessage, now: Date = Date()) -> Bool {
+        guard let sentAt = message.sentAt else { return false }
+        return now.timeIntervalSince(sentAt) > Self.backlogThreshold
+    }
+
+    private func startWatchingSystem() {
+        systemWatcher.onSleep = { [weak self] in self?.handleSleep() }
+        systemWatcher.onWake = { [weak self] in self?.handleWake() }
+        systemWatcher.onNetworkChange = { [weak self] up in self?.handleNetworkChange(up: up) }
+        systemWatcher.start()
+    }
+
+    private func handleSleep() {
+        coverage.endListening(cause: .sleep)
+        // Disconnecting deliberately is not the same as vanishing: a clean DISCONNECT
+        // leaves the persistent session — and whatever the broker queues into it — alive,
+        // where a socket left to rot is torn down by BMW's 60 s idle timeout.
+        stream?.pause()
+    }
+
+    private func handleWake() {
+        Log.app.notice("wake: gap \(Int(self.coverage.openGapDuration() ?? 0), privacy: .public)s")
+        stream?.resume()
+        scheduleResyncCheck()
+    }
+
+    private func handleNetworkChange(up: Bool) {
+        if up {
+            stream?.reconnectNow()
+            scheduleResyncCheck()
+        } else {
+            coverage.endListening(cause: .network)
+        }
+    }
+
+    /// Waits out the grace period, then decides whether the hole still needs a call.
+    ///
+    /// The wait is the point: if BMW held our session, the backlog lands within seconds
+    /// of reconnecting and there is nothing left to buy.
+    private func scheduleResyncCheck() {
+        resyncTask?.cancel()
+        resyncTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(Self.resyncGrace * 1_000_000_000))
+            guard !Task.isCancelled, let self else { return }
+            await self.resyncIfGapUnfilled()
+        }
+    }
+
+    private func resyncIfGapUnfilled(now: Date = Date()) async {
+        guard polling.enabled, polling.resyncAfterGap, phase == .ready, !isFetching else { return }
+        // Never let this trigger first-time setup: that would spend ~3 calls unasked.
+        guard Config.load().containerID != nil else { return }
+        guard let gap = coverage.unresolvedGap(minimum: Double(polling.gapMinutes) * 60) else {
+            Log.polling.debug("resync: no unresolved gap")
+            return
+        }
+
+        let today = Self.utcDay(now)
+        if resyncDay != today {
+            resyncDay = today
+            resyncsToday = 0
+        }
+        guard resyncsToday < polling.maxResyncsPerDay else {
+            Log.polling.notice("resync: daily cap of \(self.polling.maxResyncsPerDay, privacy: .public) reached")
+            return
+        }
+
+        resyncsToday += 1
+        Log.polling.notice("resync: \(gap.shortDuration, privacy: .public) \(gap.cause.reason, privacy: .public), fetching")
+        await refreshSnapshot(automatic: true)
+    }
+
+    private static func utcDay(_ date: Date) -> String {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "UTC") ?? .gmt
+        let parts = calendar.dateComponents([.year, .month, .day], from: date)
+        return "\(parts.year ?? 0)-\(parts.month ?? 0)-\(parts.day ?? 0)"
+    }
+
+    /// Stops the work that outlives any single connection.
+    ///
+    /// Deliberately separate from `stopStream()`: that runs every time the stream is
+    /// rebuilt, and folding these in meant `connect()` installed the watcher and heartbeat
+    /// and then `startStream()` immediately cancelled them — the sleep and wake handling
+    /// was never armed at all.
+    private func stopAmbientWork() {
+        heartbeatTask?.cancel()
+        heartbeatTask = nil
+        resyncTask?.cancel()
+        resyncTask = nil
+        systemWatcher.stop()
+    }
+
+    /// Keeps the on-disk heartbeat current, so the next launch can size the hole this run
+    /// leaves behind when the app is quit or killed.
+    private func startHeartbeat() {
+        heartbeatTask?.cancel()
+        heartbeatTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: UInt64(CoverageStore.heartbeat * 1_000_000_000))
+                guard !Task.isCancelled, let self else { return }
+                self.coverage.heartbeat()
             }
         }
     }
@@ -368,7 +517,13 @@ public final class AppModel {
         refreshEstimate()
         startEstimateTicker()
 
+        // Time the app was not running is a hole like any other, and the heartbeat the
+        // last run left behind is the only record of when it started.
+        coverage.seedFromPreviousRun()
+
         startStream(session: session, vin: config.vin)
+        startHeartbeat()
+        startWatchingSystem()
         phase = .ready
         Log.app.notice("ready: vin=\(config.vin != nil, privacy: .public) cached=\(self.vehicle.values.count, privacy: .public) values")
         startPolling()
@@ -377,13 +532,27 @@ public final class AppModel {
     private func startStream(session: Session, vin: String?) {
         stopStream()
 
-        let stream = CarDataStream(tokens: session.tokens, vin: vin)
+        // A persistent session is what turns a night of sleep from "everything lost" into
+        // "replayed on reconnect". BMW does not document whether they allow it, so it is
+        // asked for, and the answer is remembered (see `--cli session-test`).
+        let mode: CarDataStream.SessionMode = Config.load().shouldTryPersistentSession
+            ? .persistent(
+                clientID: Config.resolvedStreamClientID(),
+                expiry: CarDataStream.sessionExpiry
+            )
+            : .clean
+
+        let stream = CarDataStream(tokens: session.tokens, vin: vin, mode: mode)
         stream.onStatusChange = { [weak self] status in
             Log.stream.notice("\(status.summary, privacy: .public)")
-            Task { @MainActor in self?.streamStatus = status }
+            Task { @MainActor in self?.applyStreamStatus(status) }
         }
         stream.onVINDiscovered = { [weak self] discovered in
             Task { @MainActor in self?.adoptDiscoveredVIN(discovered) }
+        }
+        stream.onPersistentSessionVerdict = { supported in
+            Log.stream.notice("persistent session \(supported ? "accepted" : "refused", privacy: .public)")
+            Config.recordPersistentSession(supported)
         }
         self.stream = stream
 
@@ -398,30 +567,84 @@ public final class AppModel {
         }
     }
 
+    /// Mirrors the stream's connection state into coverage, which is where liveness stops
+    /// being cosmetic: losing the connection is the moment the car can start changing
+    /// without us.
+    private func applyStreamStatus(_ status: CarDataStream.Status) {
+        streamStatus = status
+        switch status {
+        case .connected:
+            // A persistent session means the broker held our subscription across the hole,
+            // so anything published was queued and is arriving now — our knowledge is
+            // continuous even though the connection was not. That only holds while the
+            // session itself lived: past its expiry BMW has discarded it along with the
+            // queue, and the hole is real.
+            let gap = coverage.openGapDuration() ?? 0
+            let covered = (stream?.sessionMode.isPersistent ?? false)
+                && gap < Double(CarDataStream.sessionExpiry)
+            coverage.beginListening(gapCovered: covered)
+        case .disconnected, .refused:
+            coverage.endListening(cause: .disconnected)
+        case .idle, .connecting:
+            break
+        }
+    }
+
     private func apply(_ message: StreamMessage) {
+        let now = Date()
+        let backlog = isBacklog(message, now: now)
+
         vehicle.merge(message.data)
         restoredFrom = nil
-        lastStreamMessageAt = Date()
+        lastStreamMessageAt = now
         pollingBlockedReason = nil
-        Log.stream.debug("message: \(message.data.count, privacy: .public) descriptor(s)")
+        Log.stream.debug("message: \(message.data.count, privacy: .public) descriptor(s)\(backlog ? " (backlog)" : "")")
         refreshEstimate()
 
-        // One detector drives both the banner and the matching on-screen pulse, so the
-        // two can never disagree about what happened.
-        let events = notifier.process(vehicle, preferences: notifications)
-        if let cue = events.compactMap(TransientCue.init).first {
-            transientCue = cue
+        if backlog {
+            // A replayed backlog is history, not news. Firing the detector per message
+            // would post a banner for every transition BMW queued overnight — "charging
+            // started" at 02:14, "finished" at 04:31 — all at once, at breakfast. So the
+            // backlog is absorbed silently and the detector runs once over the settled
+            // state; being transition-based, that yields the net change and nothing else.
+            scheduleBacklogSettle()
+        } else {
+            // One detector drives both the banner and the matching on-screen pulse, so the
+            // two can never disagree about what happened.
+            raiseEvents()
         }
 
         // Local history is what makes BMW's REST chargingHistory endpoint unnecessary.
         // Appending in memory rather than re-reading the file: `load()` parses every
         // line, and doing that per message meant a burst re-parsed the whole 90-day log
-        // dozens of times in a second.
-        let sample = Sample(vehicle)
+        // dozens of times in a second. Replayed messages are recorded at the time the car
+        // published them, so the sparkline fills the gap in properly rather than stacking
+        // a night's worth of readings onto the moment we woke up.
+        let sample = Sample(vehicle, at: backlog ? (message.sentAt ?? now) : now)
         if sampleLog.record(sample) {
             recentSamples = Self.trimmed(recentSamples + [sample])
         }
         scheduleStateSave()
+    }
+
+    private func raiseEvents() {
+        let events = notifier.process(vehicle, preferences: notifications)
+        if let cue = events.compactMap(TransientCue.init).first {
+            transientCue = cue
+        }
+    }
+
+    /// Runs the detector once, `backlogSettle` seconds after the last replayed message.
+    private func scheduleBacklogSettle() {
+        backlogTask?.cancel()
+        backlogTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(Self.backlogSettle * 1_000_000_000))
+            guard !Task.isCancelled, let self else { return }
+            Log.stream.notice("backlog settled; raising net events")
+            self.raiseEvents()
+            // The broker replayed what we missed, so the hole is answered.
+            self.coverage.resolveGap()
+        }
     }
 
     /// The on-disk cache only needs to be current enough to survive a relaunch, so
@@ -452,6 +675,8 @@ public final class AppModel {
         pollTask = nil
         estimateTask?.cancel()
         estimateTask = nil
+        backlogTask?.cancel()
+        backlogTask = nil
         pumpTask?.cancel()
         pumpTask = nil
         stream?.stop()

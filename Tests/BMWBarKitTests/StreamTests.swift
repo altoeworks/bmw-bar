@@ -106,3 +106,28 @@ struct StreamStatusTests {
         #expect(CarDataStream.keepAlive < 60)
     }
 }
+
+/// What BMW's CONNACK codes actually mean, pinned against observation rather than guess.
+///
+/// The codebase assumed for a long time that "another client holds the stream" arrived as
+/// `notAuthorized`. Running a second client against a live session showed it is really
+/// `0x97 quotaExceeded`. The distinction is not cosmetic: contention must never be read as
+/// "BMW refuses persistent sessions", or one minute with two copies of the app open would
+/// cache that verdict for a week and quietly throw the feature away.
+@Suite("CONNACK interpretation")
+struct ConnAckTests {
+    @Test func quotaExceededIsContentionNotRejection() {
+        #expect(CarDataStream.isContention(.quotaExceeded))
+    }
+
+    @Test func transientServerStatesAreContention() {
+        #expect(CarDataStream.isContention(.serverBusy))
+        #expect(CarDataStream.isContention(.notAuthorized))
+    }
+
+    @Test func genuineProtocolFailuresAreNot() {
+        #expect(!CarDataStream.isContention(.success))
+        #expect(!CarDataStream.isContention(.unsupportedProtocolVersion))
+        #expect(!CarDataStream.isContention(.clientIdentifierNotValid))
+    }
+}

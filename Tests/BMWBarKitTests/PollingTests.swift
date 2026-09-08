@@ -54,6 +54,31 @@ struct PollingPreferencesTests {
         #expect(config.pollingPreferences.chargingIdleMinutes == 15)
     }
 
+    /// The gap-resync settings arrived after charging-only polling. A config written in
+    /// between must keep its interval and pick up the new defaults, not reset to nothing —
+    /// the same trap that once silently discarded a saved client ID.
+    @Test func decodesAConfigWrittenBeforeGapResyncExisted() throws {
+        let old = #"{"clientID":"abc","polling":{"enabled":true,"chargingIdleMinutes":25}}"#
+        let config = try JSONDecoder().decode(Config.self, from: Data(old.utf8))
+        #expect(config.clientID == "abc")
+        #expect(config.pollingPreferences.chargingIdleMinutes == 25)
+        #expect(config.pollingPreferences.resyncAfterGap)
+        #expect(config.pollingPreferences.gapMinutes == 60)
+        #expect(config.pollingPreferences.maxResyncsPerDay == 4)
+    }
+
+    @Test func roundTripsTheResyncSettings() throws {
+        let preferences = PollingPreferences(
+            enabled: true,
+            chargingIdleMinutes: 20,
+            resyncAfterGap: false,
+            gapMinutes: 120,
+            maxResyncsPerDay: 2
+        )
+        let data = try JSONEncoder().encode(preferences)
+        #expect(try JSONDecoder().decode(PollingPreferences.self, from: data) == preferences)
+    }
+
     @Test func roundTrips() throws {
         let preferences = PollingPreferences(enabled: false, chargingIdleMinutes: 20)
         let data = try JSONEncoder().encode(preferences)
@@ -98,5 +123,46 @@ struct PollingBudgetTests {
         }
         #expect(spent == QuotaTracker.dailyLimit - QuotaTracker.reserve)
         #expect(await quota.snapshot().remaining == QuotaTracker.reserve)
+    }
+}
+
+/// Whether to ask BMW to hold our session, and how the answer is remembered.
+///
+/// The point of caching the answer is to stop paying for a doomed round trip on every
+/// launch — but a cached "no" that is never revisited would outlive whatever made it true.
+@Suite("Persistent session policy")
+struct PersistentSessionPolicyTests {
+    @Test func anUntestedConfigTries() {
+        #expect(Config().shouldTryPersistentSession)
+    }
+
+    @Test func aKnownYesKeepsTrying() {
+        let config = Config(persistentSession: true, persistentSessionTestedAt: Date())
+        #expect(config.shouldTryPersistentSession)
+    }
+
+    @Test func aRecentNoIsBelieved() {
+        let config = Config(
+            persistentSession: false,
+            persistentSessionTestedAt: Date().addingTimeInterval(-3600)
+        )
+        #expect(!config.shouldTryPersistentSession)
+    }
+
+    @Test func aStaleNoIsRetested() {
+        let old = Date().addingTimeInterval(-Config.persistentSessionRetestInterval - 60)
+        let config = Config(persistentSession: false, persistentSessionTestedAt: old)
+        #expect(config.shouldTryPersistentSession)
+    }
+
+    /// A "no" with no date attached cannot be trusted to be recent, so it is retried
+    /// rather than believed forever.
+    @Test func anUndatedNoIsRetested() {
+        #expect(Config(persistentSession: false).shouldTryPersistentSession)
+    }
+
+    @Test func sessionModeReportsItself() {
+        #expect(CarDataStream.SessionMode.persistent(clientID: "a", expiry: 60).isPersistent)
+        #expect(!CarDataStream.SessionMode.clean.isPersistent)
     }
 }

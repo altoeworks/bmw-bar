@@ -10,12 +10,33 @@ import Foundation
 ///    connection is torn down and rebuilt with a fresh token before that happens.
 /// 2. BMW disconnects clients idle for 60 s, so keep-alive is 25 s.
 /// 3. **One connection per account.** A second consumer (Home Assistant, evcc, another
-///    copy of this app) makes BMW reject this one with `notAuthorized` even though the
-///    token is perfectly valid — reported as its own state rather than retried forever
-///    as if it were an auth failure.
+///    copy of this app) makes BMW reject this one even though the token is perfectly
+///    valid. Observed directly: the broker answers `0x97 quotaExceeded`, not the
+///    `notAuthorized` this once assumed. Reported as its own state rather than retried
+///    forever as if it were an auth failure.
 ///
 /// All mutable state is confined to `queue`, which is also CocoaMQTT's delegate queue.
 public final class CarDataStream: NSObject, @unchecked Sendable {
+    /// How the MQTT session is opened, which decides what happens to messages published
+    /// while this Mac is asleep or off the network.
+    ///
+    /// `clean` throws them away: the broker forgets the subscription the moment the
+    /// socket drops. `persistent` asks the broker to keep the subscription and queue
+    /// QoS 1 messages until we come back — the difference between waking up to the car's
+    /// real state and waking up to yesterday's.
+    ///
+    /// BMW documents neither, so which one is used is decided by trying (see
+    /// `onPersistentSessionVerdict`).
+    public enum SessionMode: Equatable, Sendable {
+        case clean
+        case persistent(clientID: String, expiry: UInt32)
+
+        public var isPersistent: Bool {
+            if case .persistent = self { return true }
+            return false
+        }
+    }
+
     public enum Status: Equatable, Sendable {
         case idle
         case connecting
@@ -50,12 +71,18 @@ public final class CarDataStream: NSObject, @unchecked Sendable {
     static let reconnectMargin: TimeInterval = 5 * 60
     /// How long to wait before re-testing a stream another client is holding.
     static let retryHeldElsewhere: TimeInterval = 5 * 60
+    /// How long BMW is asked to hold the session — and its queue — after we disconnect.
+    /// The broker may grant less; its CONNACK value is the one that counts.
+    public static let sessionExpiry: UInt32 = 24 * 60 * 60
 
     private let tokens: TokenStore
     /// `nil` subscribes to the wildcard topic and learns the VIN from the first
     /// message — which is what lets a fresh install start with zero REST calls.
     private let vin: String?
     private let queue = DispatchQueue(label: "com.ohoefenstock.bmw-bar.stream")
+    /// What was asked for. `activeMode` is what is actually in use, which differs once
+    /// a persistent attempt has been downgraded.
+    private let requestedMode: SessionMode
 
     // Guarded by `queue`.
     private var client: CocoaMQTT5?
@@ -66,6 +93,11 @@ public final class CarDataStream: NSObject, @unchecked Sendable {
     private var isRotatingToken = false
     private var isStopping = false
     private var discoveredVIN: String?
+    private var activeMode: SessionMode
+    /// Set when a persistent connect was refused, so the retry opens a clean session and
+    /// the refusal is not misread as "another client holds the stream".
+    private var didDowngrade = false
+    private var verdictReported = false
 
     private var lifecycleTask: Task<Void, Never>?
     private var reconnectAttempt = 0
@@ -79,11 +111,24 @@ public final class CarDataStream: NSObject, @unchecked Sendable {
     /// persisted without ever asking BMW's REST API which vehicles exist.
     public var onVINDiscovered: (@Sendable (String) -> Void)?
 
-    /// - Parameter vin: the vehicle to follow, or `nil` to subscribe to every vehicle
-    ///   on the account and discover the VIN from the stream.
-    public init(tokens: TokenStore, vin: String? = nil) {
+    /// Whether BMW actually accepted a persistent session, reported once it is known, so
+    /// the answer can be cached instead of re-discovered on every launch.
+    public var onPersistentSessionVerdict: (@Sendable (Bool) -> Void)?
+
+    /// The session mode currently in use, which may be `.clean` even when `.persistent`
+    /// was asked for.
+    public var sessionMode: SessionMode { queue.sync { activeMode } }
+
+    /// - Parameters:
+    ///   - vin: the vehicle to follow, or `nil` to subscribe to every vehicle on the
+    ///     account and discover the VIN from the stream.
+    ///   - mode: whether to ask BMW to hold the session while we are away. A refused
+    ///     persistent session downgrades itself to `.clean` on the spot.
+    public init(tokens: TokenStore, vin: String? = nil, mode: SessionMode = .clean) {
         self.tokens = tokens
         self.vin = vin
+        self.requestedMode = mode
+        self.activeMode = mode
     }
 
     /// Messages, in arrival order. Call `start()` to connect and `stop()` to finish.
@@ -105,6 +150,44 @@ public final class CarDataStream: NSObject, @unchecked Sendable {
     }
 
     public func stop() {
+        teardown()
+        queue.sync {
+            continuation?.finish()
+            continuation = nil
+        }
+    }
+
+    /// Disconnects without ending the message stream, so the same consumer picks back up
+    /// after `resume()`.
+    ///
+    /// Used when the Mac is about to sleep. Disconnecting deliberately is not the same as
+    /// vanishing: a clean MQTT DISCONNECT leaves a persistent session — and everything the
+    /// broker queues into it — intact, where a socket left to rot gets torn down by BMW's
+    /// 60 s idle timeout instead.
+    public func pause() {
+        Log.stream.notice("pausing (mode: \(self.sessionMode.isPersistent ? "persistent" : "clean", privacy: .public))")
+        teardown()
+    }
+
+    public func resume() {
+        Log.stream.notice("resuming")
+        start()
+    }
+
+    /// Rebuilds the connection immediately instead of waiting out the backoff.
+    ///
+    /// After a wake or a network change the existing wait is worthless: `backOff()` may
+    /// have up to two minutes left to run, and its `Task.sleep` drifted through the sleep
+    /// anyway. Cancelling the lifecycle interrupts both.
+    public func reconnectNow() {
+        guard !queue.sync(execute: { isStopping }) else { return }
+        Log.stream.notice("reconnecting now")
+        teardown()
+        start()
+    }
+
+    /// Drops the connection and the lifecycle task, leaving the message stream open.
+    private func teardown() {
         queue.sync {
             isStopping = true
             client?.disconnect()
@@ -113,10 +196,6 @@ public final class CarDataStream: NSObject, @unchecked Sendable {
         }
         lifecycleTask?.cancel()
         lifecycleTask = nil
-        queue.sync {
-            continuation?.finish()
-            continuation = nil
-        }
     }
 
     // MARK: - Lifecycle
@@ -216,10 +295,26 @@ public final class CarDataStream: NSObject, @unchecked Sendable {
 
     private func connect(with tokens: TokenSet) {
         queue.sync {
+            // A persistent session is keyed on the client id, so it has to be the same
+            // one every time; a clean session has nothing to resume, so a throwaway id
+            // avoids colliding with anything.
+            let clientID: String
+            let properties: MqttConnectProperties?
+            switch activeMode {
+            case .clean:
+                clientID = "bmw-bar-\(UUID().uuidString.prefix(8))"
+                properties = nil
+            case .persistent(let stable, let expiry):
+                clientID = stable
+                let connectProperties = MqttConnectProperties()
+                connectProperties.sessionExpiryInterval = expiry
+                properties = connectProperties
+            }
+
             // BMW's broker is TLS 1.3-only, which CocoaMQTT's stock SecureTransport
             // socket cannot negotiate; see NetworkFrameworkSocket.
             let client = CocoaMQTT5(
-                clientID: "bmw-bar-\(UUID().uuidString.prefix(8))",
+                clientID: clientID,
                 host: Self.host,
                 port: Self.port,
                 socket: NetworkFrameworkSocket()
@@ -228,7 +323,10 @@ public final class CarDataStream: NSObject, @unchecked Sendable {
             client.password = tokens.idToken
             client.enableSSL = true
             client.keepAlive = Self.keepAlive
-            client.cleanSession = true
+            // MQTT 5 spells this Clean Start: false asks the broker to keep our
+            // subscription and queue QoS 1 messages while we are gone.
+            client.cleanSession = !activeMode.isPersistent
+            client.connectProperties = properties
             // Reconnects are driven by `runLifecycle` so the token can be refreshed
             // first; CocoaMQTT's own retry would keep replaying a dead credential.
             client.autoReconnect = false
@@ -283,20 +381,61 @@ extension CarDataStream: CocoaMQTT5Delegate {
         switch ack {
         case .success:
             reconnectAttempt = 0
+            if let granted = connAckData?.sessionExpiryInterval {
+                Log.stream.notice("broker session expiry: \(granted, privacy: .public)s")
+            }
+            reportVerdict(activeMode.isPersistent)
             setStatus(.connected)
             // `{gcid}/+` covers every vehicle on the account; `{gcid}/{vin}` narrows to
-            // one. BMW documents both.
+            // one. BMW documents both. Re-subscribing on a resumed session is harmless:
+            // MQTT replaces the existing subscription rather than duplicating it.
             let topic = "\(mqtt5.username ?? "")/\(vin ?? "+")"
             mqtt5.subscribe(topic, qos: .qos1)
 
-        case .notAuthorized, .badUsernameOrPassword:
-            // The token was minted moments ago, so bad credentials are unlikely; the
-            // usual cause is another client already holding the one allowed session.
-            setStatus(.refused(heldElsewhere: ack == .notAuthorized, reason: "\(ack)"))
+        case _ where Self.isContention(ack):
+            // Contention says nothing about whether BMW supports persistent sessions, so
+            // it must not trigger the downgrade below. A clean retry mints a *fresh*
+            // client id, so it would very likely succeed — and we would then cache
+            // "persistent sessions refused" for a week on the strength of a second copy
+            // of the app being open for a minute.
+            setStatus(.refused(heldElsewhere: ack != .badUsernameOrPassword, reason: "\(ack)"))
 
         default:
+            // Nothing in MQTT 5 says "clean start refused" outright: a broker that will
+            // not hold a session simply accepts the connection and reports no session
+            // present. So the only honest test is behavioural — if the persistent attempt
+            // failed and a clean one works, persistence is what BMW objected to.
+            if activeMode.isPersistent, !didDowngrade {
+                didDowngrade = true
+                activeMode = .clean
+                Log.stream.notice("persistent session refused (CONNACK \(String(describing: ack), privacy: .public)); retrying clean")
+                setStatus(.disconnected("persistent session refused (\(ack))"))
+                return
+            }
+            if didDowngrade { reportVerdict(false) }
             setStatus(.disconnected("CONNACK \(ack)"))
         }
+    }
+
+    /// Whether a CONNACK means "not now" rather than "not ever".
+    ///
+    /// `quotaExceeded` is BMW's way of saying the one connection their account allows is
+    /// already taken — confirmed by watching a second client get exactly this code while
+    /// the first held the stream. `notAuthorized` is kept here too: the token is refreshed
+    /// immediately before connecting, so bad credentials are the unlikely reading, and
+    /// retrying is the safer way to be wrong.
+    static func isContention(_ ack: CocoaMQTTCONNACKReasonCode) -> Bool {
+        switch ack {
+        case .quotaExceeded, .serverBusy, .notAuthorized, .badUsernameOrPassword: return true
+        default: return false
+        }
+    }
+
+    /// Reports what the broker allowed, once. Must be called on `queue`.
+    private func reportVerdict(_ supported: Bool) {
+        guard requestedMode.isPersistent, !verdictReported else { return }
+        verdictReported = true
+        onPersistentSessionVerdict?(supported)
     }
 
     public func mqtt5(

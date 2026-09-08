@@ -116,10 +116,27 @@ public struct PollingPreferences: Codable, Equatable, Sendable {
     public var enabled: Bool
     /// Minutes of stream silence *while charging* before a snapshot is fetched.
     public var chargingIdleMinutes: Int
+    /// Whether to spend a call catching up after the Mac was asleep or offline long
+    /// enough for the car to have changed unseen.
+    public var resyncAfterGap: Bool
+    /// How long a hole has to be before it is worth a call. Short gaps are covered by
+    /// the broker replaying what it queued.
+    public var gapMinutes: Int
+    /// A ceiling, so a laptop that sleeps between every meeting cannot eat the budget.
+    public var maxResyncsPerDay: Int
 
-    public init(enabled: Bool = true, chargingIdleMinutes: Int = 15) {
+    public init(
+        enabled: Bool = true,
+        chargingIdleMinutes: Int = 15,
+        resyncAfterGap: Bool = true,
+        gapMinutes: Int = 60,
+        maxResyncsPerDay: Int = 4
+    ) {
         self.enabled = enabled
         self.chargingIdleMinutes = chargingIdleMinutes
+        self.resyncAfterGap = resyncAfterGap
+        self.gapMinutes = gapMinutes
+        self.maxResyncsPerDay = maxResyncsPerDay
     }
 
     public static let `default` = PollingPreferences()
@@ -135,9 +152,15 @@ public struct PollingPreferences: Codable, Equatable, Sendable {
         Int((Double(callsPerHourWhileCharging) * hours).rounded())
     }
 
+    /// Worst case for the wake resync, for showing the cost honestly in settings.
+    public var resyncCallsPerDay: Int { resyncAfterGap ? maxResyncsPerDay : 0 }
+
     private enum CodingKeys: String, CodingKey {
         case enabled
         case chargingIdleMinutes
+        case resyncAfterGap
+        case gapMinutes
+        case maxResyncsPerDay
         /// Pre-charging-only key, still read so an existing config keeps its interval.
         case idleMinutes
     }
@@ -153,12 +176,21 @@ public struct PollingPreferences: Codable, Equatable, Sendable {
                 .flatMap { $0 }
             ?? (try? container.decodeIfPresent(Int.self, forKey: .idleMinutes)).flatMap { $0 }
             ?? fallback.chargingIdleMinutes
+        resyncAfterGap = (try? container.decodeIfPresent(Bool.self, forKey: .resyncAfterGap))
+            .flatMap { $0 } ?? fallback.resyncAfterGap
+        gapMinutes = (try? container.decodeIfPresent(Int.self, forKey: .gapMinutes))
+            .flatMap { $0 } ?? fallback.gapMinutes
+        maxResyncsPerDay = (try? container.decodeIfPresent(Int.self, forKey: .maxResyncsPerDay))
+            .flatMap { $0 } ?? fallback.maxResyncsPerDay
     }
 
     public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(enabled, forKey: .enabled)
         try container.encode(chargingIdleMinutes, forKey: .chargingIdleMinutes)
+        try container.encode(resyncAfterGap, forKey: .resyncAfterGap)
+        try container.encode(gapMinutes, forKey: .gapMinutes)
+        try container.encode(maxResyncsPerDay, forKey: .maxResyncsPerDay)
     }
 }
 

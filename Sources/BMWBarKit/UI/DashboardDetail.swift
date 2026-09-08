@@ -28,6 +28,48 @@ public enum DashboardDetail: String, Identifiable, CaseIterable {
         }
     }
 
+    /// The descriptors this panel is built from, so it can report how old *its* facts
+    /// are rather than borrowing the newest reading in the car.
+    var descriptors: [String] {
+        switch self {
+        case .charging:
+            return [
+                Descriptor.socDisplayed, Descriptor.socHeader, Descriptor.socTarget,
+                Descriptor.chargingStatus, Descriptor.chargingHVStatus,
+                Descriptor.chargingPower, Descriptor.chargingMethod,
+                Descriptor.chargingPortStatus, Descriptor.plugged,
+                Descriptor.chargingTimeRemaining, Descriptor.chargingTimeToFull,
+                Descriptor.acLimitSelected,
+            ]
+        case .security:
+            return [
+                Descriptor.alarmArmStatus, Descriptor.alarmIsOn,
+                Descriptor.trunkLocked, Descriptor.chargeFlapLocked,
+            ]
+        case .body:
+            return Descriptor.doors + Descriptor.windows
+                + [Descriptor.trunkOpen, Descriptor.hoodOpen, Descriptor.rearWindowOpen]
+        case .tyres:
+            return Descriptor.tyrePressures + Descriptor.tyreTargets + Descriptor.tyreTemperatures
+        case .location:
+            return [
+                Descriptor.latitude, Descriptor.longitude,
+                Descriptor.heading, Descriptor.altitude,
+            ]
+        case .climate:
+            return [
+                Descriptor.preconditioningState, Descriptor.preconditioningManual,
+                Descriptor.preconditioningAuto, Descriptor.targetTemperature,
+            ]
+        case .trip:
+            return [
+                Descriptor.tripEndDistance, Descriptor.tripConsumption,
+                Descriptor.tripRecuperation, Descriptor.tripElectricFraction,
+                Descriptor.mileage,
+            ]
+        }
+    }
+
     var symbol: String {
         switch self {
         case .charging: return "powerplug"

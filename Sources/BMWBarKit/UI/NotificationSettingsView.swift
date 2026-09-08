@@ -56,35 +56,14 @@ struct NotificationSettingsView: View {
                 .tracking(0.4)
                 .foregroundStyle(.secondary)
 
-            Toggle(isOn: Binding(
-                get: { model.polling.enabled },
-                set: {
-                    model.updatePolling(
-                        PollingPreferences(
-                            enabled: $0,
-                            chargingIdleMinutes: model.polling.chargingIdleMinutes
-                        )
-                    )
-                }
-            )) {
+            Toggle(isOn: polling(\.enabled)) {
                 Text("Fetch when the stream goes quiet mid-charge")
             }
             .toggleStyle(.checkbox)
             .font(.caption)
 
             if model.polling.enabled {
-                Stepper(
-                    value: Binding(
-                        get: { model.polling.chargingIdleMinutes },
-                        set: {
-                            model.updatePolling(
-                                PollingPreferences(enabled: true, chargingIdleMinutes: $0)
-                            )
-                        }
-                    ),
-                    in: 5...60,
-                    step: 5
-                ) {
+                Stepper(value: polling(\.chargingIdleMinutes), in: 5...60, step: 5) {
                     Text("After \(model.polling.chargingIdleMinutes) min of silence")
                         .font(.caption.monospacedDigit())
                 }
@@ -92,6 +71,35 @@ struct NotificationSettingsView: View {
 
             // The cost is the whole point of the trade-off, so it is stated up front.
             Text(pollingExplanation)
+                .font(.system(size: 9))
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Divider().opacity(0.4).padding(.vertical, 2)
+
+            Text("AFTER BEING AWAY")
+                .font(.system(size: 9, weight: .semibold))
+                .tracking(0.4)
+                .foregroundStyle(.secondary)
+
+            Toggle(isOn: polling(\.resyncAfterGap)) {
+                Text("Catch up after a long sleep")
+            }
+            .toggleStyle(.checkbox)
+            .font(.caption)
+
+            if model.polling.resyncAfterGap {
+                Stepper(value: polling(\.gapMinutes), in: 15...240, step: 15) {
+                    Text("Gaps longer than \(model.polling.gapMinutes) min")
+                        .font(.caption.monospacedDigit())
+                }
+                Stepper(value: polling(\.maxResyncsPerDay), in: 1...10, step: 1) {
+                    Text("At most \(model.polling.maxResyncsPerDay) a day")
+                        .font(.caption.monospacedDigit())
+                }
+            }
+
+            Text(resyncExplanation)
                 .font(.system(size: 9))
                 .foregroundStyle(.tertiary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -123,6 +131,20 @@ struct NotificationSettingsView: View {
         .font(.caption)
     }
 
+    /// Edits one field of the polling preferences, leaving the rest alone.
+    private func polling<Value>(
+        _ key: WritableKeyPath<PollingPreferences, Value>
+    ) -> Binding<Value> {
+        Binding(
+            get: { model.polling[keyPath: key] },
+            set: {
+                var updated = model.polling
+                updated[keyPath: key] = $0
+                model.updatePolling(updated)
+            }
+        )
+    }
+
     private func caption(_ text: String, systemImage: String) -> some View {
         Label(text, systemImage: systemImage)
             .font(.caption2)
@@ -144,6 +166,19 @@ struct NotificationSettingsView: View {
             + "nothing. About \(perHour) of BMW's 50 daily calls per hour of charging "
             + "(~\(typical) for a three-hour charge). These are non-essential, so they "
             + "stop early and always leave room for a manual fetch."
+    }
+
+    /// The wake-up catch-up is the second thing that can spend the budget unasked, so it
+    /// gets the same plain accounting as the charging poll.
+    private var resyncExplanation: String {
+        guard model.polling.resyncAfterGap else {
+            return "With this off, a gap is only ever reported, never filled. The panel "
+                + "still marks which readings predate it."
+        }
+        return "While the Mac is asleep the app hears nothing. BMW usually replays what it "
+            + "queued once the stream reconnects, and only when that does not happen is a "
+            + "snapshot fetched — at most \(model.polling.maxResyncsPerDay) a day. A Mac "
+            + "that sleeps overnight typically costs one call."
     }
 
     private func commit() {

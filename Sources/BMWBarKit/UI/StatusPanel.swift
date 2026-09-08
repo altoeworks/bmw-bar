@@ -7,6 +7,9 @@ struct StatusPanel: View {
     @Bindable var model: AppModel
     @State private var showingSettings = false
     @State private var detail: DashboardDetail?
+    /// The banner is a prompt, not an alarm; it can be waved away without pretending the
+    /// gap did not happen. A newer gap brings it back.
+    @State private var dismissedGap = false
 
     /// Opens straight onto a detail panel. Only used by `--cli render`, so the drill-down
     /// screens can be inspected without a running app.
@@ -41,6 +44,8 @@ struct StatusPanel: View {
         .frame(width: Self.width)
         .animation(.easeInOut(duration: 0.2), value: showingSettings)
         .animation(.easeInOut(duration: 0.2), value: detail)
+        // A dismissal covers the gap it was aimed at, not every gap from now on.
+        .onChange(of: model.coverage.lastGap) { _, _ in dismissedGap = false }
     }
 
     // MARK: - Dashboard
@@ -48,6 +53,15 @@ struct StatusPanel: View {
     private var dashboard: some View {
         VStack(alignment: .leading, spacing: 12) {
             header
+
+            if let gap = model.coverage.unresolvedGap(), !dismissedGap {
+                GapBanner(
+                    gap: gap,
+                    isFetching: model.isFetching,
+                    refresh: { Task { await model.refreshSnapshot() } },
+                    dismiss: { dismissedGap = true }
+                )
+            }
 
             if model.isAwaitingFirstReport {
                 awaitingFirstReport
@@ -71,10 +85,12 @@ struct StatusPanel: View {
                 Circle()
                     .fill(streamColor)
                     .frame(width: 6, height: 6)
-                Text(shortStreamStatus)
+                Text(streamStatusText)
                     .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(hasGap ? .orange : .secondary)
+                    .monospacedDigit()
             }
+            .help(streamStatusHelp)
             Button {
                 showingSettings = true
             } label: {
@@ -101,7 +117,8 @@ struct StatusPanel: View {
                 cue: model.transientCue,
                 isEstimated: estimated,
                 reportedPercent: model.vehicle.chargePercent,
-                reportedAt: model.vehicle.chargeReportedAt
+                reportedAt: model.vehicle.chargeReportedAt,
+                confidence: model.coverage.confidence(of: model.vehicle.chargeReportedAt)
             )
             .onChange(of: model.transientCue) { _, cue in
                 guard cue != nil else { return }
@@ -213,6 +230,15 @@ struct StatusPanel: View {
     private func detailPanel(_ detail: DashboardDetail) -> some View {
         VStack(alignment: .leading, spacing: 12) {
             backBar(title: detail.title, symbol: detail.symbol) { self.detail = nil }
+
+            // Each panel dates its own facts. A single age for the whole car would be a
+            // lie: these descriptors are reported independently and drift hours apart.
+            FreshnessLine(
+                reportedAt: model.vehicle.newestTimestamp(among: detail.descriptors),
+                confidence: model.coverage.confidence(
+                    of: model.vehicle.newestTimestamp(among: detail.descriptors)
+                )
+            )
 
             // Deliberately not in a ScrollView: every panel has a bounded number of
             // rows (sessions are capped at five), so the tallest is still shorter than
@@ -352,23 +378,46 @@ struct StatusPanel: View {
 
     // MARK: - Helpers
 
+    private var hasGap: Bool { model.coverage.unresolvedGap() != nil }
+
+    /// Green means more than "the socket is open": it means the app has been listening
+    /// continuously, so what is on screen is what the car last said. A connection that
+    /// came back after a hole it could not fill is amber, because the picture behind it
+    /// may already be wrong.
     private var streamColor: Color {
         switch model.streamStatus {
-        case .connected: return .green
+        case .connected: return hasGap ? .orange : .green
         case .connecting: return .yellow
         case .refused: return .red
         case .idle, .disconnected: return .secondary
         }
     }
 
-    private var shortStreamStatus: String {
+    /// Liveness alone was the thing that misled: a green "Live" sat happily over data
+    /// that had not moved in hours. The chip now carries the age too.
+    private var streamStatusText: String {
         switch model.streamStatus {
         case .connecting: return "Connecting"
         case .refused: return "In use elsewhere"
         case .disconnected: return "Offline"
         case .idle: return "Idle"
-        case .connected: return "Live"
+        case .connected:
+            if let gap = model.coverage.unresolvedGap() {
+                return "Live · gap \(gap.shortDuration)"
+            }
+            guard let heard = model.vehicle.newestReadingTimestamp else { return "Live" }
+            return "Live · \(Freshness.span(Date().timeIntervalSince(heard)))"
         }
+    }
+
+    private var streamStatusHelp: String {
+        if let gap = model.coverage.unresolvedGap() {
+            return "Connected, but the app was \(gap.cause.reason) for \(gap.shortDuration) "
+                + "and could not recover what the car said in that time."
+        }
+        guard case .connected = model.streamStatus else { return model.streamStatus.summary }
+        return "Connected and listening. The time is how long ago the car last reported — "
+            + "it only speaks when something happens."
     }
 
     private func number(_ value: Double) -> String {

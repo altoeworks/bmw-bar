@@ -121,8 +121,10 @@ swift run BMWBar --cli whoami                    # stored session (offline)
 swift run BMWBar --cli setup                     # resolve VIN + telemetry container (REST)
 swift run BMWBar --cli status                    # one REST snapshot (1 API call)
 swift run BMWBar --cli stream                    # follow the live feed (free, zero calls)
+swift run BMWBar --cli session-test              # does BMW queue messages while we're away?
 swift run BMWBar --cli mood                      # colour + motion for each vehicle state
 swift run BMWBar --cli render panel.png          # render the dashboard to an image (no network)
+swift run BMWBar --cli render --gap 8 panel.png  # …staged as if the Mac had been away 8 h
 swift run BMWBar --cli notify-test               # post a sample notification (bundled app only)
 swift run BMWBar --cli quota                     # today's API budget (offline)
 swift run BMWBar --cli containers                # list/delete telemetry containers
@@ -302,6 +304,56 @@ Three things keep it there, each of which was a genuine hazard:
 The parked-location map also no longer carries `.id(coordinate)`, which was rebuilding
 an entire MapKit view every time the car moved.
 
+## Sleeping through the interesting part
+
+Streaming has one structural weakness: it is push-only. Nothing published while the Mac
+is asleep, off the network, or shut down is ever delivered again — so a car that finishes
+charging at 03:00 leaves no trace, and the panel wakes up showing yesterday with no way to
+tell you it is doing so. Two things address that.
+
+**BMW's broker will hold the session for you.** The app connects with a stable client id,
+`cleanSession = false` and a requested session expiry of 24 hours. BMW documents none of
+this, so it was measured — `--cli session-test` connects, disconnects, waits while you
+lock the car from the MyBMW app, and reconnects. The broker answers `sp: true` and grants
+the full `86400s`, which means it keeps the subscription and queues QoS 1 messages while
+you are gone. The session even outlives the process: a connect made minutes after the
+previous run exited still reported `sp: true`. So an overnight sleep now replays on
+reconnect instead of vanishing.
+
+Because nothing in MQTT 5 says "clean start refused" outright — a broker that will not
+hold a session simply accepts the connection and reports no session present — the fallback
+is behavioural: if a persistent connect fails and a clean one then works, the answer is
+cached in `config.json` and retried a week later. Contention codes are excluded from that
+test, for the reason given above.
+
+**And where it cannot be recovered, the app says so.** `CoverageTracker` records when the
+app was actually in a position to hear from the car: gaps open on sleep
+(`NSWorkspace.willSleepNotification`), on network loss (`NWPathMonitor`), on a dropped
+stream, and on the app not running at all — the last sized by a heartbeat file the
+previous run leaves behind, so a quick relaunch inherits its window instead of marking
+everything unknown. Anything the car reported while we were listening is *confirmed*;
+anything older than a hole we could not fill is *unconfirmed*, and shown in amber.
+
+That distinction is the point. There is no single "age of the data" to show: each
+descriptor carries its own BMW timestamp and they drift far apart — one real cache held
+the car's altitude from the previous evening beside seventy values from that morning. So
+the header chip carries liveness *and* age (`Live · 18m`, or amber `Live · gap 8h`), each
+detail panel dates its own facts rather than borrowing the newest reading in the car, and
+the ring drops its estimate across a gap because there is no longer a reading it can
+honestly extrapolate from.
+
+When a hole is left over, a strip offers the one action that would settle it, priced:
+one snapshot, 1 of the 50 daily calls. It only fires by itself after the broker has had
+45 seconds to replay and did not, for gaps over an hour, at most four times a day — a Mac
+that sleeps overnight costs about one call. All of it is in Settings under **After being
+away**.
+
+The honest limit: waking is not receiving. Nothing arrives while the Mac is genuinely
+asleep, so a notification about a charge that finished at 03:00 reaches you when you open
+the lid. A replayed backlog is absorbed silently and the detector runs once over the
+settled state, so you get one notification for what actually changed rather than a night's
+worth of banners at breakfast.
+
 ## Things worth knowing
 
 - **Nothing is fetched at startup — a normal install makes zero API calls, ever.** The
@@ -323,9 +375,13 @@ an entire MapKit view every time the car moved.
   that is treated as authoritative over the local count. The 5-call reserve for
   essential requests *is* a local choice (`QuotaTracker.reserve`).
 - **One MQTT connection per account.** If Home Assistant, evcc, or a second copy of
-  this app is already streaming, BMW refuses this one with `notAuthorized` even though
-  the token is valid. The panel says so explicitly and retries every 5 minutes rather
-  than treating it as an auth failure.
+  this app is already streaming, BMW refuses this one even though the token is valid.
+  The refusal arrives as CONNACK **`0x97 quotaExceeded`** — measured by running a second
+  client against a live session, having previously assumed it was `notAuthorized`. The
+  panel says so explicitly and retries every 5 minutes rather than treating it as an
+  auth failure. The distinction earns its keep: contention must never be mistaken for
+  "BMW refuses persistent sessions", or a minute with two copies open would cache that
+  verdict and silently throw the feature below away.
 - **Polling happens only while charging.** That is the only time the number moves on its
   own, so it is the only time a fetch buys anything — a parked car polled all day would
   spend the whole 50-call budget to learn it is still parked. Confining it that way is
@@ -353,7 +409,9 @@ an entire MapKit view every time the car moved.
   reads `reported 4m ago`. Any real reading replaces the estimate immediately.
 - **The car reports when it chooses to.** Values are push-based, so the panel shows
   when the reading is from rather than implying it is live. Waking the car (locking or
-  unlocking from the MyBMW app) usually triggers an update.
+  unlocking from the MyBMW app) usually triggers an update. A green dot means more than
+  "the socket is open" — it means the app has been listening continuously, so what is on
+  screen is what the car last said. See *Sleeping through the interesting part*.
 - **Tokens** live in `~/Library/Application Support/bmw-bar/tokens.json`, mode 0600.
   The Keychain would be the more obvious home, but an ad-hoc-signed app gets a new code
   signature on every rebuild and macOS then prompts for the login password each time.
