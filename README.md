@@ -5,6 +5,12 @@ A macOS status bar monitor for a BMW i4, built on **BMW CarData**.
 Shows charge level, charging status, power, time remaining, charge limit, electric
 range and plug state — updating live over BMW's MQTT stream.
 
+**Idle**
+![image](./panel.png)
+
+**Charging**
+![image](./panel-charging.png)
+
 ## What this can and cannot do
 
 **It cannot start or stop charging, and it cannot change the charge limit.**
@@ -64,11 +70,14 @@ This part cannot be automated. Do it before first launch.
    - `vehicle.powertrain.electric.battery.stateOfCharge.target`
    - `vehicle.drivetrain.electricEngine.kombiRemainingElectricRange`
 
-   One real-world catch: a BMW i4 has been observed streaming
-   `vehicle.drivetrain.lastRemainingRange` for its range instead of the descriptor
-   above — despite BMW's own catalogue listing that id as ICE/PHEV/MHEV only, not BEV.
-   The app subscribes to both and uses whichever reported most recently, so this isn't
-   something you need to work around, just something to expect if you go looking.
+   Two real-world catches, both cases of BMW's catalogue not matching what the car
+   actually sends — treat the catalogue as a starting point, not ground truth:
+   - A BMW i4 streams `vehicle.drivetrain.lastRemainingRange` for its range instead of
+     the descriptor above, despite the catalogue listing that id as ICE/PHEV/MHEV only,
+     not BEV. The app subscribes to both and uses whichever reported most recently.
+   - `charging.method` documents its range as `AC_TYPE1PLUG, AC_TYPE2PLUG, NOCHARGING`,
+     but a real i4 charging on a CCS inlet sends `AC_TYP2COMBO`, which is in none of
+     them. Unlisted plug values are tidied into readable names rather than dropped.
 6. Save.
 
 The portal's streaming selection is separate from anything the app does — a field only
@@ -82,7 +91,19 @@ drive before concluding something is missing.
 make app        # builds build/BMWBar.app
 make run        # builds and launches it
 make test       # runs the test suite
+make smoke      # launches the real bundle and asserts it finishes starting up
+make logs       # follows the running app's own logging
 ```
+
+`make smoke` exists because of a bug no unit test could catch: a `TimelineView` placed
+in the `MenuBarExtra` **label** wedged SwiftUI inside `MenuBarExtraController.updateButton`,
+blocking the main thread so `applicationDidFinishLaunching` never returned. Everything
+compiled, all tests passed, and the app silently never connected to anything. The smoke
+target launches the bundle and asserts the app logs `ready:`.
+
+The app logs to `os_log` under the subsystem `com.ohoefenstock.bmw-bar`, with categories
+`app`, `stream`, `polling` and `api` — a status bar app has nowhere to print, and
+without this the stream and the poll leave no trace at all. No tokens are logged.
 
 On first launch the panel walks you through pasting the Client ID and approving this
 Mac in the browser.
@@ -138,12 +159,42 @@ under the charge ring, and every tile renders even when its data has never arriv
 showing "—" instead of disappearing. A stable layout is what makes it readable at a
 glance. Settings, the one thing that isn't data, live behind the gear.
 
-To see the panel without a running app or screen recording:
+Every tile is a door into a **detail panel** — click through for the reading behind the
+summary: all four tyre pressures against their targets, every door and window
+individually, the full charging supply breakdown, a pannable map. Escape or the chevron
+goes back.
+
+To see any screen without a running app or screen recording:
 
 ```bash
-swift run BMWBar --cli render panel.png              # your real cached state
-swift run BMWBar --cli render --charging panel.png   # synthetic charging state
+swift run BMWBar --cli render panel.png                   # your real cached state
+swift run BMWBar --cli render --charging panel.png        # synthetic charging state
+swift run BMWBar --cli render --detail body panel.png     # a specific detail panel
 ```
+
+`--detail` takes `body`, `tyres`, `charging`, `security`, `location`, `climate` or
+`trip`. MapKit and `Link` don't draw inside `ImageRenderer`, so the map and the
+"Open in Maps" row appear blank in a render but are fine in the app.
+
+## Closed is not locked
+
+The Body panel shows opening state and lock state as separate columns, because BMW
+reports them for different points. Of **245 catalogued descriptors, exactly two concern
+locking**: `body.trunk.isLocked` and `body.flap.isLocked`. So:
+
+| Point | Open / closed | Locked |
+|---|---|---|
+| Doors ×4 | yes | **never reported** |
+| Windows ×4 + tailgate glass | yes, incl. an `INTERMEDIATE` "ajar" state | never reported |
+| Boot | yes | yes — the only point with both |
+| Bonnet | yes | never reported |
+| Charge flap | never reported | yes |
+
+There is no central-locking descriptor at all. The alarm's arm state is the closest
+proxy, and the app labels it "Armed" rather than claiming the doors are locked. In
+practice on a real i4 the boot lock has never streamed either, leaving the charge flap
+as the only live lock reading — so a tile saying "All closed · 1 unlocked" is usually
+telling you about the charge flap.
 
 ## What it shows
 
@@ -224,6 +275,31 @@ identifier). To verify delivery:
 build/BMWBar.app/Contents/MacOS/BMWBar --cli notify-test
 ```
 
+## Memory and back-pressure
+
+A status bar app runs all day, so the message path is written to stay flat. Measured on
+a real charging session: **74 MB resident, 17 MB footprint, stable**.
+
+Three things keep it there, each of which was a genuine hazard:
+
+- **Nothing rebuilds the status item on a timer.** A `TimelineView` in the
+  `MenuBarExtra` *label* once put SwiftUI into a runaway loop inside
+  `MenuBarExtraController.updateButton` — a sampled stack showed 942 of 1653 samples
+  parked there, on the main thread. It blocked `applicationDidFinishLaunching`, so the
+  app never started, and allocated continuously while doing it. The charge estimate is
+  ticked on `AppModel` instead and the label is a plain view. `make smoke` guards this.
+- **The stream buffer is bounded.** `AsyncStream`'s default policy is `.unbounded`, and
+  BMW genuinely sends bursts — 82 messages in a single second has been observed, one per
+  descriptor. Paired with a consumer doing file I/O, that is an unbounded queue behind a
+  slow reader. It is now `.bufferingNewest(512)`.
+- **The consumer does no per-message disk work.** It previously re-read and re-parsed
+  the entire 90-day sample log *and* re-encoded the whole state file on every message.
+  Samples are now appended in memory within a bounded window, and state writes are
+  coalesced to at most one every two seconds (and flushed on teardown).
+
+The parked-location map also no longer carries `.id(coordinate)`, which was rebuilding
+an entire MapKit view every time the car moved.
+
 ## Things worth knowing
 
 - **Nothing is fetched at startup — a normal install makes zero API calls, ever.** The
@@ -248,6 +324,31 @@ build/BMWBar.app/Contents/MacOS/BMWBar --cli notify-test
   this app is already streaming, BMW refuses this one with `notAuthorized` even though
   the token is valid. The panel says so explicitly and retries every 5 minutes rather
   than treating it as an auth failure.
+- **Polling happens only while charging.** That is the only time the number moves on its
+  own, so it is the only time a fetch buys anything — a parked car polled all day would
+  spend the whole 50-call budget to learn it is still parked. Confining it that way is
+  what makes a short interval affordable: at the default 15 minutes a charge costs about
+  4 calls an hour (~12 for a three-hour charge), and an idle day costs nothing at all.
+  The fetches are also deliberately **non-essential**, so they stop at the 5-call reserve
+  and can never starve a manual "Fetch now", and they refuse to run before setup has
+  cached a container so a poll can never trigger first-time setup you didn't ask for.
+  Toggle and interval live in Settings.
+- **CarData is event-driven, and this matters most while charging.** The car publishes
+  when something *happens* — locked, plugged in, charge started — not on a clock. A
+  charge level quietly climbing is not an event. Observed on a real i4: 22 minutes of
+  active charging with **no message at all**, then locking the car from the MyBMW app
+  released a burst revealing the charge had gone 64% → 69% the whole time. The MyBMW
+  app looks live only because opening it wakes the vehicle and queries it; the stream
+  never does that, and no amount of reconnecting changes it.
+
+  So the charge is **extrapolated between reports** — energy in = power × time,
+  converted to percent via the pack's usable capacity, clamped at the charge limit.
+  Against that real 22-minute gap the model predicted 70.0% where the car later said
+  69%, about a point high since it ignores charging losses and BMW reports whole
+  percents. It is never presented as a reading. The ring carries the whole story: the
+  estimate prefixed with `~`, and beneath it the car's own last figure and how old it
+  is — `~87%` over `was 82% · 20m ago`. When nothing is being estimated that line just
+  reads `reported 4m ago`. Any real reading replaces the estimate immediately.
 - **The car reports when it chooses to.** Values are push-based, so the panel shows
   when the reading is from rather than implying it is live. Waking the car (locking or
   unlocking from the MyBMW app) usually triggers an update.

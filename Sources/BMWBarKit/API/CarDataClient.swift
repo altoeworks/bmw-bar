@@ -70,13 +70,20 @@ public actor CarDataClient {
         return try decode(VehicleBasicData.self, from: data)
     }
 
-    /// A full snapshot of the container's descriptors. Essential: this is what fills
-    /// the panel at launch, before the first stream message arrives.
-    public func telematicData(vin: String, containerID: String) async throws -> [String: TelematicValue] {
+    /// A full snapshot of the container's descriptors.
+    ///
+    /// - Parameter essential: `true` for a fetch the user asked for, which may dip into
+    ///   the reserve. The background idle poll passes `false` so it can never spend the
+    ///   headroom a manual "Fetch now" depends on.
+    public func telematicData(
+        vin: String,
+        containerID: String,
+        essential: Bool = true
+    ) async throws -> [String: TelematicValue] {
         let data = try await get(
             "/customers/vehicles/\(vin)/telematicData",
             query: [URLQueryItem(name: "containerId", value: containerID)],
-            essential: true
+            essential: essential
         )
         return try decode(TelematicDataResponse.self, from: data).telematicData ?? [:]
     }

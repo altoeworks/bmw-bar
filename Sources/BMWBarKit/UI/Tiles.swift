@@ -122,14 +122,24 @@ struct BodyTile: View {
 
     var body: some View {
         let open = vehicle.openThings
+        let unlocked = vehicle.unlockedThings
         Tile(
             title: "Body",
             symbol: open.isEmpty ? "car.side" : "car.side.rear.open",
-            tint: open.isEmpty ? .secondary : .orange
+            tint: open.isEmpty && unlocked.isEmpty ? .secondary : .orange
         ) {
             switch vehicle.isAllClosed {
             case .some(true):
-                TileValue(text: "All closed")
+                // Closed and locked are separate facts, so a shut car with an unlocked
+                // boot still deserves the amber.
+                TileValue(
+                    text: "All closed",
+                    // A tile column is ~100pt: names don't fit, so count here and
+                    // name them in the detail panel.
+                    detail: unlocked.isEmpty
+                        ? lockSummary
+                        : "\(unlocked.count) unlocked"
+                )
             case .some(false):
                 TileValue(
                     text: open.count == 1 ? open[0] : "\(open.count) open",
@@ -140,6 +150,12 @@ struct BodyTile: View {
                 TileValue(text: "—", tone: .secondary)
             }
         }
+    }
+
+    /// Only claims "locked" for the points BMW actually reports one for.
+    private var lockSummary: String? {
+        let lockable = vehicle.lockableThings
+        return lockable.isEmpty ? nil : "\(lockable.count) locked"
     }
 }
 
@@ -206,8 +222,10 @@ struct LocationTile: View {
                 }
                 .mapStyle(.standard(pointsOfInterest: .excludingAll))
                 .mapControlVisibility(.hidden)
-                // Re-create when the car moves; a parked car never does.
-                .id("\(location.latitude),\(location.longitude)")
+                // Deliberately no `.id(...)` here: keying the view on the coordinate
+                // rebuilds the whole MapKit view whenever the car moves, and those are
+                // expensive. MenuBarExtra tears this down when the panel closes, so a
+                // fresh map with the right camera arrives on next open anyway.
                 .overlay(alignment: .bottomTrailing) {
                     Image(systemName: "arrow.up.forward.app.fill")
                         .font(.system(size: 11))
@@ -346,7 +364,9 @@ private struct SessionRow: View {
     private static let when: Date.FormatStyle = .dateTime.day().month(.abbreviated).hour().minute()
 
     var body: some View {
-        let tone: Color = session.completedNormally ? .primary : .orange
+        let tone: Color = session.isInProgress
+            ? VehicleMood.Tone.charging.color
+            : (session.completedNormally ? .primary : .orange)
         HStack {
             Text(session.startedAt, format: Self.when)
                 .font(.system(size: 11))
@@ -365,6 +385,7 @@ private struct SessionRow: View {
         if let energy = session.energyKWh { parts.append(String(format: "~%.1f kWh", energy)) }
         let minutes = Int(session.duration / 60)
         parts.append(minutes < 60 ? "\(minutes) min" : "\(minutes / 60) h \(minutes % 60) min")
+        if session.isInProgress { parts.append("now") }
         return parts.joined(separator: " · ")
     }
 }

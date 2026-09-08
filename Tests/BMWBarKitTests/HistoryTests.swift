@@ -217,3 +217,120 @@ struct SparklineDataTests {
         #expect(SparklineData.points(from: [sample(50, hoursAgo: 1, now: now)], now: now).isEmpty)
     }
 }
+
+@Suite("Session noise filtering")
+struct SessionNoiseTests {
+    private func sample(_ soc: Double, _ status: String, second: Double) -> Sample {
+        Sample(
+            at: Date(timeIntervalSince1970: second),
+            soc: soc,
+            powerKW: 11,
+            status: status,
+            plugged: true
+        )
+    }
+
+    /// A charging status that flips within the same second leaves a zero-length
+    /// "session" that reads like a failed charge. It is one sample, not an event.
+    @Test func dropsZeroLengthBlips() {
+        let samples = [
+            sample(66, "CHARGINGACTIVE", second: 0),
+            sample(66, "NOCHARGING", second: 0),
+        ]
+        #expect(ChargingSessionBuilder.sessions(from: samples).isEmpty)
+    }
+
+    @Test func dropsSessionsUnderAMinute() {
+        let samples = [
+            sample(66, "CHARGINGACTIVE", second: 0),
+            sample(66, "NOCHARGING", second: 30),
+        ]
+        #expect(ChargingSessionBuilder.sessions(from: samples).isEmpty)
+    }
+
+    /// Anything long enough to be a real charge still comes through untouched.
+    @Test func keepsGenuineSessions() {
+        let samples = [
+            sample(60, "CHARGINGACTIVE", second: 0),
+            sample(66, "CHARGINGENDED", second: 3600),
+        ]
+        let sessions = ChargingSessionBuilder.sessions(from: samples)
+        #expect(sessions.count == 1)
+        #expect(sessions[0].socGained == 6)
+    }
+}
+
+@Suite("In-progress sessions")
+struct InProgressSessionTests {
+    private func sample(_ soc: Double, _ status: String, minute: Double) -> Sample {
+        Sample(
+            at: Date(timeIntervalSince1970: minute * 60),
+            soc: soc,
+            powerKW: 10.5,
+            status: status,
+            plugged: true
+        )
+    }
+
+    /// A charge still running has no terminating sample. It must not be styled as a
+    /// failure just because it hasn't finished.
+    @Test func runningChargeIsNeitherCompleteNorFailed() throws {
+        let samples = [
+            sample(64, "CHARGINGACTIVE", minute: 0),
+            sample(69, "CHARGINGACTIVE", minute: 22),
+        ]
+        let session = try #require(ChargingSessionBuilder.sessions(from: samples).first)
+        #expect(session.isInProgress)
+        #expect(!session.completedNormally)
+    }
+
+    @Test func finishedChargeIsNotInProgress() throws {
+        let samples = [
+            sample(64, "CHARGINGACTIVE", minute: 0),
+            sample(80, "CHARGINGENDED", minute: 90),
+        ]
+        let session = try #require(ChargingSessionBuilder.sessions(from: samples).first)
+        #expect(!session.isInProgress)
+        #expect(session.completedNormally)
+    }
+}
+
+@Suite("In-memory sample window")
+struct SampleWindowTests {
+    private func samples(_ count: Int) -> [Sample] {
+        (0..<count).map {
+            Sample(
+                at: Date(timeIntervalSince1970: Double($0)),
+                soc: 50,
+                powerKW: nil,
+                status: "NOCHARGING",
+                plugged: false
+            )
+        }
+    }
+
+    /// The on-disk log keeps 90 days; the in-memory copy must stay bounded regardless,
+    /// since it is rebuilt on the main actor as messages arrive.
+    @Test func trimsToTheWindow() {
+        let trimmed = AppModel.trimmed(samples(AppModel.samplesKeptInMemory + 500))
+        #expect(trimmed.count == AppModel.samplesKeptInMemory)
+    }
+
+    /// Trimming keeps the *newest* samples — the sparkline and recent sessions both
+    /// look at the recent end.
+    @Test func keepsTheNewestSamples() {
+        let trimmed = AppModel.trimmed(samples(AppModel.samplesKeptInMemory + 10))
+        #expect(trimmed.last?.at == Date(timeIntervalSince1970: Double(AppModel.samplesKeptInMemory + 9)))
+    }
+
+    @Test func leavesSmallLogsAlone() {
+        let few = samples(12)
+        #expect(AppModel.trimmed(few).count == 12)
+    }
+
+    /// 5000 samples is far more than the 24 h sparkline or recent sessions need, while
+    /// still being small in memory.
+    @Test func windowComfortablyCoversTheSparkline() {
+        #expect(AppModel.samplesKeptInMemory >= 1_000)
+    }
+}

@@ -87,8 +87,13 @@ public final class CarDataStream: NSObject, @unchecked Sendable {
     }
 
     /// Messages, in arrival order. Call `start()` to connect and `stop()` to finish.
+    /// - Note: bounded on purpose. `AsyncStream`'s default policy is `.unbounded`, so a
+    ///   burst the consumer can't keep up with grows without limit — BMW really does
+    ///   send bursts (82 messages in one second has been observed, one per descriptor).
+    ///   These are sparse deltas, so under genuine pressure discarding the oldest is far
+    ///   better than unbounded growth.
     public func messages() -> AsyncStream<StreamMessage> {
-        AsyncStream { continuation in
+        AsyncStream(bufferingPolicy: .bufferingNewest(512)) { continuation in
             queue.sync { self.continuation = continuation }
         }
     }

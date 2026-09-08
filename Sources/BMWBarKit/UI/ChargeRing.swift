@@ -10,11 +10,20 @@ struct ChargeRing: View {
     let mood: VehicleMood
     /// A one-shot pulse, cleared by the parent once played.
     let cue: TransientCue?
+    /// Whether `percent` is extrapolated rather than reported, which the ring marks
+    /// with a "~" so an estimate is never mistaken for a reading.
+    var isEstimated = false
+    /// The car's own last reading, shown beneath the estimate so both numbers and the
+    /// reading's age are visible without opening a panel.
+    var reportedPercent: Double?
+    var reportedAt: Date?
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private let lineWidth: CGFloat = 9
-    private let diameter: CGFloat = 108
+    // Slightly larger than the number alone needs: the reported value and its age sit
+    // under it, inside the ring.
+    private let diameter: CGFloat = 116
 
     @State private var pulse: CGFloat = 0
 
@@ -78,21 +87,65 @@ struct ChargeRing: View {
     }
 
     private var centreLabel: some View {
-        VStack(spacing: 0) {
+        VStack(spacing: 1) {
             if let percent {
-                Text("\(Int(percent.rounded()))")
-                    .font(.system(size: 30, weight: .medium, design: .rounded))
-                    .monospacedDigit()
-                    .contentTransition(.numericText())
-                Text("%")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+                HStack(alignment: .firstTextBaseline, spacing: 0) {
+                    if isEstimated {
+                        Text("~")
+                            .font(.system(size: 19, weight: .regular, design: .rounded))
+                            .foregroundStyle(.secondary)
+                    }
+                    Text("\(Int(percent.rounded()))")
+                        .font(.system(size: 30, weight: .medium, design: .rounded))
+                        .monospacedDigit()
+                        .contentTransition(.numericText())
+                    Text("%")
+                        .font(.system(size: 13, weight: .regular, design: .rounded))
+                        .foregroundStyle(.secondary)
+                        .baselineOffset(1)
+                }
+                provenance
             } else {
                 Text("—")
                     .font(.system(size: 28, weight: .medium, design: .rounded))
                     .foregroundStyle(.secondary)
             }
         }
+        .frame(maxWidth: diameter - lineWidth * 2 - 8)
+    }
+
+    /// Where the big number came from: the car's own reading and how old it is. While
+    /// estimating both are shown, since the two numbers differ; otherwise the age alone
+    /// is the useful part.
+    @ViewBuilder
+    private var provenance: some View {
+        if let text = provenanceText {
+            Text(text)
+                .font(.system(size: 9, weight: .medium, design: .rounded))
+                .monospacedDigit()
+                .foregroundStyle(.tertiary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+        }
+    }
+
+    private var provenanceText: String? {
+        let age = reportedAt.map { Self.age(of: $0) }
+        guard isEstimated, let reported = reportedPercent else {
+            return age.map { "reported \($0)" }
+        }
+        let reportedText = "\(Int(reported.rounded()))%"
+        return age.map { "was \(reportedText) · \($0)" } ?? "was \(reportedText)"
+    }
+
+    /// Compact enough to fit inside the ring.
+    static func age(of date: Date, now: Date = Date()) -> String {
+        let seconds = max(0, now.timeIntervalSince(date))
+        if seconds < 90 { return "just now" }
+        let minutes = Int(seconds / 60)
+        if minutes < 60 { return "\(minutes)m ago" }
+        let hours = minutes / 60
+        return hours < 24 ? "\(hours)h ago" : "\(hours / 24)d ago"
     }
 
     // MARK: - Motion
@@ -121,7 +174,11 @@ struct ChargeRing: View {
 
     private var accessibilityText: String {
         guard let percent else { return "Charge level unknown" }
-        var text = "Charge \(Int(percent.rounded())) percent, \(mood.label)"
+        var text = "Charge \(isEstimated ? "estimated " : "")\(Int(percent.rounded())) percent, \(mood.label)"
+        if isEstimated, let reported = reportedPercent {
+            text += ", last reported \(Int(reported.rounded())) percent"
+        }
+        if let reportedAt { text += " \(Self.age(of: reportedAt))" }
         if let limitPercent { text += ", limit \(Int(limitPercent.rounded())) percent" }
         return text
     }

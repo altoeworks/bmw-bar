@@ -10,6 +10,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     public let model = AppModel()
 
     public func applicationDidFinishLaunching(_ notification: Notification) {
+        Log.app.notice("did finish launching")
         Task { await model.start() }
     }
 }

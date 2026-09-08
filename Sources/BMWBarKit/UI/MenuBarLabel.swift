@@ -8,6 +8,10 @@ struct MenuBarLabel: View {
     let model: AppModel
 
     var body: some View {
+        // Deliberately a plain view. A TimelineView here wedges SwiftUI inside
+        // `MenuBarExtraController.updateButton` while it builds the status item,
+        // blocking the main thread so hard the app never finishes launching. The
+        // estimate advances via `AppModel`'s ticker instead.
         HStack(spacing: 3) {
             Image(systemName: symbolName)
             if let text = percentText {
@@ -18,7 +22,7 @@ struct MenuBarLabel: View {
     }
 
     private var percentText: String? {
-        guard let percent = model.vehicle.chargePercent else { return nil }
+        guard let percent = model.displayChargePercent else { return nil }
         return "\(Int(percent.rounded()))%"
     }
 

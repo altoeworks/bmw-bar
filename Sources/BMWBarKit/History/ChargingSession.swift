@@ -26,6 +26,10 @@ public struct ChargingSession: Equatable, Sendable, Identifiable {
         return energyKWh / (duration / 3600)
     }
 
+    /// No terminating sample yet — the charge is still running, which is neither a
+    /// success nor a failure and must not be coloured like one.
+    public var isInProgress: Bool { endStatus == nil }
+
     /// Whether it stopped on its own terms rather than being cut short.
     public var completedNormally: Bool {
         switch endStatus {
@@ -36,12 +40,20 @@ public struct ChargingSession: Equatable, Sendable, Identifiable {
 }
 
 public enum ChargingSessionBuilder {
+    /// Sessions shorter than this are dropped: a charging status that flips within a
+    /// second leaves a "0 min" entry that reads like a failed charge but is really one
+    /// sample.
+    public static let minimumDuration: TimeInterval = 60
+
     /// Reconstructs sessions from a sample log.
     ///
     /// A session runs from the first actively-charging sample to the first sample that
     /// is no longer charging. Sessions still in progress at the end of the log are
     /// included, ending at the last sample.
-    public static func sessions(from samples: [Sample]) -> [ChargingSession] {
+    public static func sessions(
+        from samples: [Sample],
+        minimumDuration: TimeInterval = minimumDuration
+    ) -> [ChargingSession] {
         let ordered = samples.sorted { $0.at < $1.at }
         var sessions: [ChargingSession] = []
         var current: [Sample] = []
@@ -59,7 +71,7 @@ public enum ChargingSessionBuilder {
         if !current.isEmpty {
             sessions.append(make(current, terminator: nil))
         }
-        return sessions
+        return sessions.filter { $0.duration >= minimumDuration }
     }
 
     private static func make(_ charging: [Sample], terminator: Sample?) -> ChargingSession {

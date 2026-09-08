@@ -49,6 +49,57 @@ struct NotificationSettingsView: View {
                 commit()
             }
 
+            Divider().opacity(0.4).padding(.vertical, 2)
+
+            Text("WHILE CHARGING")
+                .font(.system(size: 9, weight: .semibold))
+                .tracking(0.4)
+                .foregroundStyle(.secondary)
+
+            Toggle(isOn: Binding(
+                get: { model.polling.enabled },
+                set: {
+                    model.updatePolling(
+                        PollingPreferences(
+                            enabled: $0,
+                            chargingIdleMinutes: model.polling.chargingIdleMinutes
+                        )
+                    )
+                }
+            )) {
+                Text("Fetch when the stream goes quiet mid-charge")
+            }
+            .toggleStyle(.checkbox)
+            .font(.caption)
+
+            if model.polling.enabled {
+                Stepper(
+                    value: Binding(
+                        get: { model.polling.chargingIdleMinutes },
+                        set: {
+                            model.updatePolling(
+                                PollingPreferences(enabled: true, chargingIdleMinutes: $0)
+                            )
+                        }
+                    ),
+                    in: 5...60,
+                    step: 5
+                ) {
+                    Text("After \(model.polling.chargingIdleMinutes) min of silence")
+                        .font(.caption.monospacedDigit())
+                }
+            }
+
+            // The cost is the whole point of the trade-off, so it is stated up front.
+            Text(pollingExplanation)
+                .font(.system(size: 9))
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if let blocked = model.pollingBlockedReason {
+                caption(blocked, systemImage: "exclamationmark.circle")
+            }
+
             if case .unavailable(let reason) = model.notifier.availability {
                 caption(reason, systemImage: "exclamationmark.triangle")
             } else if model.notifier.availability == .denied {
@@ -77,6 +128,22 @@ struct NotificationSettingsView: View {
             .font(.caption2)
             .foregroundStyle(.secondary)
             .fixedSize(horizontal: false, vertical: true)
+    }
+
+    /// Spells out what the poll can cost, since it is the only thing in the app that
+    /// spends BMW's budget without a click.
+    private var pollingExplanation: String {
+        guard model.polling.enabled else {
+            return "The car publishes on events, not on a clock, so a charge can progress "
+                + "for a long time with nothing sent. With this off, the ring simply "
+                + "estimates until the car reports again."
+        }
+        let perHour = model.polling.callsPerHourWhileCharging
+        let typical = model.polling.calls(forChargeLasting: 3)
+        return "Only while charging — a parked car is never polled, so an idle day costs "
+            + "nothing. About \(perHour) of BMW's 50 daily calls per hour of charging "
+            + "(~\(typical) for a three-hour charge). These are non-essential, so they "
+            + "stop early and always leave room for a manual fetch."
     }
 
     private func commit() {

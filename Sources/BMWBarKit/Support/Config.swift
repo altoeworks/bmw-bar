@@ -12,24 +12,33 @@ public struct Config: Codable, Equatable {
     /// Absent in configs written before notifications existed, so it resolves to the
     /// defaults rather than failing to decode.
     public var notifications: NotificationPreferences?
+    /// Absent in configs written before idle polling existed.
+    public var polling: PollingPreferences?
 
     public init(
         clientID: String? = nil,
         vin: String? = nil,
         containerID: String? = nil,
         vehicleName: String? = nil,
-        notifications: NotificationPreferences? = nil
+        notifications: NotificationPreferences? = nil,
+        polling: PollingPreferences? = nil
     ) {
         self.clientID = clientID
         self.vin = vin
         self.containerID = containerID
         self.vehicleName = vehicleName
         self.notifications = notifications
+        self.polling = polling
     }
 
     public var notificationPreferences: NotificationPreferences {
         get { notifications ?? .default }
         set { notifications = newValue }
+    }
+
+    public var pollingPreferences: PollingPreferences {
+        get { polling ?? .default }
+        set { polling = newValue }
     }
 
     public static func load() -> Config {

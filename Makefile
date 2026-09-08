@@ -40,6 +40,29 @@ TEST_FLAGS := -Xswiftc -F -Xswiftc $(TEST_FW) \
 test:
 	swift test $(TEST_FLAGS)
 
+## Launch the real bundle and assert it actually finishes starting up.
+##
+## No unit test can catch this class of bug: a TimelineView in the MenuBarExtra *label*
+## once wedged SwiftUI inside `updateButton`, blocking the main thread so
+## `applicationDidFinishLaunching` never returned. Everything compiled, every test
+## passed, and the app silently never connected.
+smoke: app
+	@pkill -f "BMWBar.app" 2>/dev/null || true
+	@sleep 1
+	@open $(BUNDLE)
+	@sleep 12
+	@log show --last 1m --predicate 'subsystem == "com.ohoefenstock.bmw-bar"' \
+		--style compact --info --debug 2>/dev/null > /tmp/bmwbar-smoke.log || true
+	@grep -q "ready:" /tmp/bmwbar-smoke.log \
+		&& echo "smoke: OK - app reached .ready" \
+		|| { echo "smoke: FAILED - app never reached .ready (main thread blocked?)"; \
+		     tail -5 /tmp/bmwbar-smoke.log; exit 1; }
+
+## Follow the running app's own logging.
+logs:
+	@log stream --predicate 'subsystem == "com.ohoefenstock.bmw-bar"' \
+		--style compact --level debug
+
 clean:
 	swift package clean
 	rm -rf build

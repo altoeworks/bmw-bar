@@ -270,14 +270,16 @@ struct PlugDescriptorTests {
         return state
     }
 
+    /// The AC/DC prefix is dropped: the Charging panel already breaks out AC voltage,
+    /// current and phase count, and a tile column is too narrow to spend on it.
     @Test func namesTheAcPlugTypes() {
         #expect(
             state([Descriptor.chargingMethod: TelematicValue(raw: .string("AC_TYPE2PLUG"))])
-                .chargingPlugType == "AC Type 2"
+                .chargingPlugType == "Type 2"
         )
         #expect(
             state([Descriptor.chargingMethod: TelematicValue(raw: .string("AC_TYPE1PLUG"))])
-                .chargingPlugType == "AC Type 1"
+                .chargingPlugType == "Type 1"
         )
     }
 
@@ -293,12 +295,29 @@ struct PlugDescriptorTests {
         }
     }
 
-    /// BMW may add DC plug types; an unknown value is shown rather than dropped.
-    @Test func passesThroughUnknownPlugTypes() {
+    /// A real i4 streams `AC_TYP2COMBO`, which is *not* in BMW's documented range of
+    /// AC_TYPE1PLUG / AC_TYPE2PLUG / NOCHARGING. The documented range is not exhaustive.
+    @Test func handlesTheUndocumentedValueARealI4Sends() {
+        #expect(
+            state([Descriptor.chargingMethod: TelematicValue(raw: .string("AC_TYP2COMBO"))])
+                .chargingPlugType == "Type 2 Combo"
+        )
+    }
+
+    @Test func namesDCPlugs() {
         #expect(
             state([Descriptor.chargingMethod: TelematicValue(raw: .string("DC_CCS"))])
-                .chargingPlugType == "Dc Ccs"
+                .chargingPlugType == "CCS"
         )
+    }
+
+    /// Whatever BMW invents next must still read as words — never "Ac Typ2Combo",
+    /// which is what a blanket `.capitalized` produced.
+    @Test func tidiesUnknownPlugValuesInsteadOfCapitalisingThem() {
+        let tidied = VehicleState.tidyPlugName("AC_TYP3PLUG")
+        #expect(tidied == "Type 3")
+        #expect(!tidied.contains("_"))
+        #expect(!tidied.hasPrefix("Ac"))
     }
 
     /// This one is a vehicle setting, not a live state.
@@ -350,5 +369,198 @@ struct RangeSourceTests {
 
     @Test func nilWhenNeitherArrives() {
         #expect(state([:]).electricRangeKm == nil)
+    }
+}
+
+@Suite("Body openings and locking")
+struct BodyOpeningTests {
+    private func state(_ pairs: [String: TelematicValue]) -> VehicleState {
+        let state = VehicleState()
+        state.merge(pairs)
+        return state
+    }
+
+    /// Of 245 catalogued descriptors only two concern locking, so the boot is the one
+    /// point where open and locked are independently known.
+    @Test func bootReportsOpenAndLockedSeparately() {
+        let s = state([
+            Descriptor.trunkOpen: TelematicValue(raw: .bool(false)),
+            Descriptor.trunkLocked: TelematicValue(raw: .bool(false)),
+        ])
+        let boot = try! #require(s.bodyOpenings.first { $0.kind == .boot })
+        #expect(boot.isOpen == false)
+        #expect(boot.isLocked == false)
+        #expect(boot.openingText == "Closed")
+        #expect(boot.lockText == "Unlocked")
+    }
+
+    /// A shut car with an unlocked boot is not "all secure" — the tile must still warn.
+    @Test func closedButUnlockedIsSurfaced() {
+        let s = state([
+            Descriptor.doorFrontLeft: TelematicValue(raw: .bool(false)),
+            Descriptor.trunkOpen: TelematicValue(raw: .bool(false)),
+            Descriptor.trunkLocked: TelematicValue(raw: .bool(false)),
+        ])
+        #expect(s.isAllClosed == true)
+        #expect(s.unlockedThings.map(\.name) == ["Boot"])
+    }
+
+    /// Doors and windows have no lock descriptor at all; claiming otherwise would be
+    /// inventing data.
+    @Test func doorsAndWindowsNeverClaimALockState() {
+        let s = state([
+            Descriptor.doorFrontLeft: TelematicValue(raw: .bool(false)),
+            Descriptor.windowFrontLeft: TelematicValue(raw: .string("CLOSED")),
+        ])
+        for point in s.bodyOpenings where point.kind == .door || point.kind == .window {
+            #expect(point.isLocked == nil, "\(point.name) must not report a lock")
+            #expect(point.lockText == nil)
+        }
+    }
+
+    /// The charge flap is the mirror image: a lock but no open/closed reading.
+    @Test func chargeFlapReportsOnlyItsLock() {
+        let s = state([Descriptor.chargeFlapLocked: TelematicValue(raw: .bool(true))])
+        let flap = try! #require(s.bodyOpenings.first { $0.kind == .chargeFlap })
+        #expect(flap.isLocked == true)
+        #expect(flap.opening == nil)
+        #expect(flap.openingText == "—")
+    }
+
+    /// INTERMEDIATE is the case worth catching — a window left ajar.
+    @Test func ajarWindowIsItsOwnState() {
+        let s = state([Descriptor.windowFrontLeft: TelematicValue(raw: .string("INTERMEDIATE"))])
+        let window = try! #require(s.bodyOpenings.first { $0.id == Descriptor.windowFrontLeft })
+        #expect(window.opening == .ajar)
+        #expect(window.openingText == "Ajar")
+        #expect(window.isOpen == true)
+        #expect(s.openThings.count == 1)
+    }
+
+    /// Every point is listed whether or not it reported, so the panel's layout is stable.
+    @Test func allPointsAreListedEvenWhenSilent() {
+        let points = state([:]).bodyOpenings
+        #expect(points.count == 12)  // 4 doors, 4 windows + tailgate glass, boot, bonnet, flap
+        #expect(points.allSatisfy { $0.opening == nil && $0.isLocked == nil })
+        #expect(Set(points.map(\.group)) == ["Doors", "Windows", "Other"])
+        // Ids are the descriptors, so they are unique and stable for SwiftUI identity.
+        #expect(Set(points.map(\.id)).count == points.count)
+    }
+
+    /// Unreported points must not be counted as closed.
+    @Test func silenceIsNotClosed() {
+        #expect(state([:]).isAllClosed == nil)
+        #expect(state([:]).openThings.isEmpty)
+        #expect(state([:]).lockableThings.isEmpty)
+    }
+}
+
+@Suite("Charge prediction between reports")
+struct ChargePredictionTests {
+    private let reportedAt = Date(timeIntervalSince1970: 1_788_782_400)
+
+    /// Mirrors the real i4 gap: 64% at 10.55 kW into a 66 kWh pack.
+    private func charging(
+        soc: Double = 64,
+        powerKW: Double = 10.55,
+        capacity: Double = 66,
+        limit: Double? = 100,
+        status: String = "CHARGINGACTIVE"
+    ) -> VehicleState {
+        let state = VehicleState()
+        var values: [String: TelematicValue] = [
+            Descriptor.socHeader: TelematicValue(raw: .number(soc), unit: "percent", timestamp: reportedAt),
+            Descriptor.chargingStatus: TelematicValue(raw: .string(status), timestamp: reportedAt),
+            Descriptor.chargingPower: TelematicValue(raw: .number(powerKW * 1000), unit: "W", timestamp: reportedAt),
+            Descriptor.maxEnergy: TelematicValue(raw: .number(capacity), unit: "kWh", timestamp: reportedAt),
+        ]
+        if let limit {
+            values[Descriptor.socTarget] = TelematicValue(raw: .number(limit), timestamp: reportedAt)
+        }
+        state.merge(values)
+        return state
+    }
+
+    /// The case that prompted this: 22 minutes of charging with no message at all.
+    /// The car later reported 69%; this must land close, not sit frozen at 64%.
+    @Test func fillsTheGapDuringACharge() throws {
+        let state = charging()
+        let predicted = try #require(
+            state.predictedChargePercent(asOf: reportedAt.addingTimeInterval(22.4 * 60))
+        )
+        #expect(abs(predicted - 70) < 0.2)
+        #expect(state.isChargeEstimated(asOf: reportedAt.addingTimeInterval(22.4 * 60)))
+    }
+
+    /// A parked car must never have its number invented.
+    @Test func doesNotPredictWhenNotCharging() {
+        let state = charging(status: "NOCHARGING")
+        #expect(state.predictedChargePercent(asOf: reportedAt.addingTimeInterval(3600)) == nil)
+        #expect(state.displayChargePercent(asOf: reportedAt.addingTimeInterval(3600)) == 64)
+        #expect(!state.isChargeEstimated(asOf: reportedAt.addingTimeInterval(3600)))
+    }
+
+    /// Charging stops at the limit, so the estimate must not sail past it.
+    @Test func clampsToTheChargeLimit() throws {
+        let state = charging(soc: 78, limit: 80)
+        let predicted = try #require(
+            state.predictedChargePercent(asOf: reportedAt.addingTimeInterval(6 * 3600))
+        )
+        #expect(predicted == 80)
+    }
+
+    @Test func clampsTo100WhenNoLimitReported() throws {
+        let state = charging(soc: 95, limit: nil)
+        let predicted = try #require(
+            state.predictedChargePercent(asOf: reportedAt.addingTimeInterval(6 * 3600))
+        )
+        #expect(predicted == 100)
+    }
+
+    /// Without power or capacity there is nothing to extrapolate from — fall back to
+    /// the reading rather than guessing.
+    @Test func needsPowerAndCapacity() {
+        let noPower = charging(powerKW: 0)
+        #expect(noPower.predictedChargePercent(asOf: reportedAt.addingTimeInterval(3600)) == nil)
+        #expect(noPower.displayChargePercent(asOf: reportedAt.addingTimeInterval(3600)) == 64)
+    }
+
+    /// A fresh reading is not an estimate, so the UI must not label it one.
+    @Test func isNotEstimatedImmediatelyAfterAReading() {
+        let state = charging()
+        #expect(!state.isChargeEstimated(asOf: reportedAt))
+        #expect(state.displayChargePercent(asOf: reportedAt) == 64)
+    }
+
+    /// Any real reading replaces the extrapolation outright.
+    @Test func aNewReadingResetsTheBaseline() throws {
+        let state = charging()
+        let later = reportedAt.addingTimeInterval(22 * 60)
+        #expect(try #require(state.predictedChargePercent(asOf: later)) > 69)
+
+        state.merge([
+            Descriptor.socHeader: TelematicValue(raw: .number(69), unit: "percent", timestamp: later)
+        ])
+        // Predicting from the new baseline at the same instant means no drift yet.
+        #expect(state.predictedChargePercent(asOf: later) == nil || state.chargePercent == 69)
+        #expect(state.displayChargePercent(asOf: later) == 69)
+    }
+}
+
+@Suite("Charge ring provenance")
+struct ChargeRingProvenanceTests {
+    private let now = Date(timeIntervalSince1970: 1_788_782_400)
+
+    /// The ring carries the reading's age, so it has to read compactly inside a circle.
+    @Test func formatsAgeCompactly() {
+        #expect(ChargeRing.age(of: now.addingTimeInterval(-30), now: now) == "just now")
+        #expect(ChargeRing.age(of: now.addingTimeInterval(-22 * 60), now: now) == "22m ago")
+        #expect(ChargeRing.age(of: now.addingTimeInterval(-3 * 3600), now: now) == "3h ago")
+        #expect(ChargeRing.age(of: now.addingTimeInterval(-49 * 3600), now: now) == "2d ago")
+    }
+
+    /// A clock skew must not produce a negative age.
+    @Test func handlesAFutureTimestamp() {
+        #expect(ChargeRing.age(of: now.addingTimeInterval(60), now: now) == "just now")
     }
 }

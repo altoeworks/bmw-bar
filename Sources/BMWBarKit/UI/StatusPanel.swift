@@ -6,6 +6,14 @@ import SwiftUI
 struct StatusPanel: View {
     @Bindable var model: AppModel
     @State private var showingSettings = false
+    @State private var detail: DashboardDetail?
+
+    /// Opens straight onto a detail panel. Only used by `--cli render`, so the drill-down
+    /// screens can be inspected without a running app.
+    init(model: AppModel, initialDetail: DashboardDetail? = nil) {
+        self.model = model
+        _detail = State(initialValue: initialDetail)
+    }
 
     static let width: CGFloat = 372
     private let gap: CGFloat = 8
@@ -18,7 +26,13 @@ struct StatusPanel: View {
             case .connecting:
                 connecting
             case .ready:
-                if showingSettings { settings } else { dashboard }
+                if showingSettings {
+                    settings
+                } else if let detail {
+                    detailPanel(detail)
+                } else {
+                    dashboard
+                }
             case .failed(let message):
                 failure(message)
             }
@@ -26,6 +40,7 @@ struct StatusPanel: View {
         .padding(14)
         .frame(width: Self.width)
         .animation(.easeInOut(duration: 0.2), value: showingSettings)
+        .animation(.easeInOut(duration: 0.2), value: detail)
     }
 
     // MARK: - Dashboard
@@ -72,13 +87,21 @@ struct StatusPanel: View {
         }
     }
 
+    /// Reads the model's ticked values rather than running its own timeline — see
+    /// `AppModel.displayChargePercent` for why a TimelineView is unsafe here.
     private var hero: some View {
-        HStack(alignment: .center, spacing: 18) {
+        let charge = model.displayChargePercent
+        let estimated = model.isChargeEstimated
+
+        return HStack(alignment: .center, spacing: 18) {
             ChargeRing(
-                percent: model.vehicle.chargePercent,
+                percent: charge,
                 limitPercent: model.vehicle.chargeLimitPercent,
                 mood: model.mood,
-                cue: model.transientCue
+                cue: model.transientCue,
+                isEstimated: estimated,
+                reportedPercent: model.vehicle.chargePercent,
+                reportedAt: model.vehicle.chargeReportedAt
             )
             .onChange(of: model.transientCue) { _, cue in
                 guard cue != nil else { return }
@@ -105,10 +128,17 @@ struct StatusPanel: View {
 
                 // Charging detail only while charging; otherwise the limit. Either way
                 // the row is present, so the hero never jumps in height.
-                Text(heroDetail)
+                Text(heroDetail(estimated: estimated))
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
+                    // One line, always: the hero is a fixed-height row, and a real
+                    // charging string ("10.6 kW · Type 2 Combo · 2 h 31 min left")
+                    // is long enough to wrap and shove the sparkline down.
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.85)
+                    .truncationMode(.tail)
+                    .help(heroDetail(estimated: estimated))
 
                 Sparkline(samples: model.recentSamples, tint: model.mood.color)
                     .frame(height: 22)
@@ -117,7 +147,7 @@ struct StatusPanel: View {
         }
     }
 
-    private var heroDetail: String {
+    private func heroDetail(estimated: Bool) -> String {
         if model.vehicle.isCharging {
             var parts: [String] = []
             if let power = model.vehicle.chargingPowerKW, power > 0 { parts.append("\(number(power)) kW") }
@@ -125,6 +155,8 @@ struct StatusPanel: View {
             if let minutes = model.vehicle.chargingMinutesRemaining, minutes > 0 {
                 parts.append("\(duration(minutes: minutes)) left")
             }
+            // Provenance lives on the ring's "~" and in the Charging panel; adding it
+            // here only truncates the line.
             return parts.isEmpty ? "Charging" : parts.joined(separator: " · ")
         }
         if let limit = model.vehicle.chargeLimitPercent {
@@ -137,26 +169,31 @@ struct StatusPanel: View {
         let columns = Array(repeating: GridItem(.flexible(), spacing: gap), count: 3)
         return LazyVGrid(columns: columns, spacing: gap) {
             PlugTile(vehicle: model.vehicle)
+                .opensDetail(.charging, selection: $detail)
             SecurityTile(vehicle: model.vehicle)
+                .opensDetail(.security, selection: $detail)
             BodyTile(vehicle: model.vehicle)
+                .opensDetail(.body, selection: $detail)
 
             TyresTile(vehicle: model.vehicle, marginBar: model.notifications.tyreMarginBar)
+                .opensDetail(.tyres, selection: $detail)
             LocationTile(vehicle: model.vehicle)
+                .opensDetail(.location, selection: $detail)
             ClimateTile(vehicle: model.vehicle)
+                .opensDetail(.climate, selection: $detail)
 
             TripTile(vehicle: model.vehicle)
+                .opensDetail(.trip, selection: $detail)
             OdometerTile(vehicle: model.vehicle)
+                .opensDetail(.trip, selection: $detail)
             EfficiencyTile(vehicle: model.vehicle)
+                .opensDetail(.trip, selection: $detail)
         }
     }
 
     private var footer: some View {
         HStack(spacing: 6) {
-            if let reading = model.vehicle.newestReadingTimestamp {
-                Text("Reported \(reading, format: .relative(presentation: .named))")
-            }
             if let quota = model.quota {
-                Text("·")
                 Text("\(quota.used)/\(quota.limit) API")
                     .help("BMW allows 50 REST calls a day. Live data arrives over the stream and is free.")
             }
@@ -173,28 +210,52 @@ struct StatusPanel: View {
         .foregroundStyle(.secondary)
     }
 
+    private func detailPanel(_ detail: DashboardDetail) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            backBar(title: detail.title, symbol: detail.symbol) { self.detail = nil }
+
+            // Deliberately not in a ScrollView: every panel has a bounded number of
+            // rows (sessions are capped at five), so the tallest is still shorter than
+            // the dashboard itself. A scroll container would add nothing — and would
+            // render blank under ImageRenderer, breaking `--cli render --detail`.
+            DetailPanel(detail: detail, model: model)
+
+            footer
+        }
+    }
+
+    /// Shared header for any screen that isn't the dashboard.
+    private func backBar(
+        title: String,
+        symbol: String? = nil,
+        back: @escaping () -> Void
+    ) -> some View {
+        HStack(spacing: 6) {
+            Button(action: back) {
+                Image(systemName: "chevron.left")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .padding(.trailing, 2)
+            }
+            .buttonStyle(.plain)
+            .keyboardShortcut(.escape, modifiers: [])
+
+            if let symbol {
+                Image(systemName: symbol)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+            Text(title)
+                .font(.system(size: 15, weight: .semibold))
+            Spacer()
+        }
+    }
+
     // MARK: - Settings
 
     private var settings: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Button {
-                    showingSettings = false
-                } label: {
-                    Label("Back", systemImage: "chevron.left")
-                        .font(.system(size: 12, weight: .medium))
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(.secondary)
-                Spacer()
-                Text("Settings")
-                    .font(.system(size: 15, weight: .semibold))
-                Spacer()
-                // Balances the Back button so the title stays centred.
-                Label("Back", systemImage: "chevron.left")
-                    .font(.system(size: 12, weight: .medium))
-                    .hidden()
-            }
+            backBar(title: "Settings", symbol: "gearshape") { showingSettings = false }
 
             NotificationSettingsView(model: model)
 

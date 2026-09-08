@@ -103,6 +103,65 @@ public struct NotificationPreferences: Codable, Equatable, Sendable {
     }
 }
 
+/// When to fall back to a REST snapshot because the stream has gone quiet.
+///
+/// CarData publishes on events, not on a clock, so a charge can progress for a long
+/// time in silence — 22 minutes of silent charging has been observed on a real i4.
+///
+/// Polling is deliberately limited to **while the car is charging**. That is the only
+/// time the number changes on its own, so it is the only time a fetch buys anything: a
+/// parked car polled all day would spend the whole 50-call budget to learn it is still
+/// parked. Confining it that way is what makes a much shorter interval affordable.
+public struct PollingPreferences: Codable, Equatable, Sendable {
+    public var enabled: Bool
+    /// Minutes of stream silence *while charging* before a snapshot is fetched.
+    public var chargingIdleMinutes: Int
+
+    public init(enabled: Bool = true, chargingIdleMinutes: Int = 15) {
+        self.enabled = enabled
+        self.chargingIdleMinutes = chargingIdleMinutes
+    }
+
+    public static let `default` = PollingPreferences()
+
+    /// What the setting costs while a charge is actually running, which is the only
+    /// figure that means anything now polling is charging-only.
+    public var callsPerHourWhileCharging: Int {
+        chargingIdleMinutes > 0 ? max(1, 60 / chargingIdleMinutes) : 0
+    }
+
+    /// Rough cost of a typical charge, for showing the user the real trade-off.
+    public func calls(forChargeLasting hours: Double) -> Int {
+        Int((Double(callsPerHourWhileCharging) * hours).rounded())
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case enabled
+        case chargingIdleMinutes
+        /// Pre-charging-only key, still read so an existing config keeps its interval.
+        case idleMinutes
+    }
+
+    /// Decoded tolerantly, so adding a field later cannot orphan an existing config.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let fallback = PollingPreferences()
+        enabled = (try? container.decodeIfPresent(Bool.self, forKey: .enabled))
+            .flatMap { $0 } ?? fallback.enabled
+        chargingIdleMinutes =
+            (try? container.decodeIfPresent(Int.self, forKey: .chargingIdleMinutes))
+                .flatMap { $0 }
+            ?? (try? container.decodeIfPresent(Int.self, forKey: .idleMinutes)).flatMap { $0 }
+            ?? fallback.chargingIdleMinutes
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(enabled, forKey: .enabled)
+        try container.encode(chargingIdleMinutes, forKey: .chargingIdleMinutes)
+    }
+}
+
 /// Turns a stream of vehicle states into discrete charging events.
 ///
 /// Deliberately pure and synchronous so the tricky parts — not firing on the launch

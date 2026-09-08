@@ -53,6 +53,61 @@ public final class VehicleState {
         self[Descriptor.socTarget]?.doubleValue
     }
 
+    /// When the car actually measured the charge level, by its own clock.
+    public var chargeReportedAt: Date? {
+        self[Descriptor.socDisplayed]?.timestamp ?? self[Descriptor.socHeader]?.timestamp
+    }
+
+    /// Usable pack capacity in kWh, needed to turn kW into %/hour.
+    public var usableCapacityKWh: Double? {
+        self[Descriptor.maxEnergy]?.doubleValue ?? batteryCapacityKWh
+    }
+
+    /// Charge extrapolated forward from the last reading, for the gaps between reports.
+    ///
+    /// **Why this exists:** BMW CarData is event-driven. The car publishes when
+    /// something *happens* — locked, plugged in, charge started — but a charge level
+    /// quietly climbing is not an event, so nothing is sent. Observed on a real i4:
+    /// 22 minutes of active charging with no message at all, then a lock event released
+    /// a burst showing the charge had gone 64% → 69% the whole time. The MyBMW app
+    /// looks live only because opening it wakes the car and queries it.
+    ///
+    /// So the number is estimated between reports: energy in = power × time, converted
+    /// to percent via the pack's usable capacity. Against that real 22-minute gap this
+    /// predicted 70.0% where the car later said 69% — about a point high, since the
+    /// figure ignores charging losses and BMW reports whole percents. Never presented
+    /// as a reading, and any real reading immediately replaces it.
+    public func predictedChargePercent(asOf now: Date = Date()) -> Double? {
+        guard isCharging,
+              let reported = chargePercent,
+              let reportedAt = chargeReportedAt,
+              let power = chargingPowerKW, power > 0,
+              let capacity = usableCapacityKWh, capacity > 0
+        else { return nil }
+
+        let hours = now.timeIntervalSince(reportedAt) / 3600
+        guard hours > 0 else { return nil }
+
+        let gained = power * hours / capacity * 100
+        // Charging stops at the limit, so the estimate must not sail past it.
+        let ceiling = chargeLimitPercent ?? 100
+        return min(reported + gained, ceiling)
+    }
+
+    /// The charge to show: the estimate while charging, the reading otherwise.
+    public func displayChargePercent(asOf now: Date = Date()) -> Double? {
+        predictedChargePercent(asOf: now) ?? chargePercent
+    }
+
+    /// Whether `displayChargePercent` is an extrapolation rather than a reading, so the
+    /// UI can say so instead of implying precision it doesn't have.
+    public func isChargeEstimated(asOf now: Date = Date()) -> Bool {
+        guard let predicted = predictedChargePercent(asOf: now), let reported = chargePercent
+        else { return false }
+        // Below a whole percent of drift it is still effectively the reported number.
+        return predicted - reported >= 1
+    }
+
     /// The AC current limit selected in the car, in amps. Also read-only.
     public var acCurrentLimitAmps: Double? {
         self[Descriptor.acLimitSelected]?.doubleValue
@@ -60,16 +115,43 @@ public final class VehicleState {
 
     /// The plug type in use, in plain words. `nil` when nothing is connected — BMW
     /// reports NOCHARGING rather than omitting the field.
+    ///
+    /// BMW's catalogue documents only `AC_TYPE1PLUG`, `AC_TYPE2PLUG` and `NOCHARGING`,
+    /// but a real i4 streams `AC_TYP2COMBO` (a CCS Combo 2 inlet charging on AC), so
+    /// the documented range cannot be treated as exhaustive. Unrecognised values are
+    /// tidied rather than dropped, and never blindly `.capitalized` — that turned
+    /// `AC_TYP2COMBO` into the nonsense "Ac Typ2Combo".
     public var chargingPlugType: String? {
         guard let raw = self[Descriptor.chargingMethod]?.stringValue?.uppercased() else {
             return nil
         }
         switch raw {
-        case "AC_TYPE1PLUG": return "AC Type 1"
-        case "AC_TYPE2PLUG": return "AC Type 2"
-        case "NOCHARGING", "INVALID", "-NA-": return nil
-        default: return raw.replacingOccurrences(of: "_", with: " ").capitalized
+        case "NOCHARGING", "INVALID", "-NA-", "": return nil
+        case "AC_TYPE1PLUG", "AC_TYP1PLUG": return "Type 1"
+        case "AC_TYPE2PLUG", "AC_TYP2PLUG": return "Type 2"
+        case "AC_TYPE2COMBO", "AC_TYP2COMBO": return "Type 2 Combo"
+        case "DC_TYPE2COMBO", "DC_TYP2COMBO", "DC_CCS": return "CCS"
+        default: return Self.tidyPlugName(raw)
         }
+    }
+
+    /// Best-effort readable name for a plug value BMW has not documented.
+    static func tidyPlugName(_ raw: String) -> String {
+        let body = raw
+            .replacingOccurrences(of: "AC_", with: "")
+            .replacingOccurrences(of: "DC_", with: "")
+            .replacingOccurrences(of: "PLUG", with: "")
+            .replacingOccurrences(of: "_", with: " ")
+        // TYP2 / TYPE2 -> "Type 2"; leaves acronyms like CCS alone.
+        let spaced = body
+            .replacingOccurrences(of: "TYPE", with: "TYP")
+            .replacingOccurrences(of: "TYP", with: "Type ")
+            .replacingOccurrences(of: "COMBO", with: " Combo")
+        return spaced
+            .split(separator: " ")
+            .map(String.init)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
     }
 
     /// Whether the charging plug releases itself when charging finishes. A setting the
@@ -169,6 +251,50 @@ public enum OpeningState: Equatable, Sendable {
     public var isOpen: Bool { self != .closed }
 }
 
+/// One point on the car that can be open, locked, or both.
+///
+/// **Open and locked are separate facts, and BMW reports them for different points.**
+/// Of 245 catalogued descriptors exactly two concern locking — `body.trunk.isLocked`
+/// and `body.flap.isLocked` — so the boot is the only place both are known, the charge
+/// flap reports only its lock, and doors and windows report only whether they are open.
+/// `nil` means BMW publishes nothing for that combination, which the UI states plainly
+/// rather than dressing up as "closed" or "unlocked".
+public struct BodyOpening: Identifiable, Equatable, Sendable {
+    public enum Kind: Equatable, Sendable {
+        case door
+        case window
+        case boot
+        case bonnet
+        case chargeFlap
+    }
+
+    /// The descriptor id, which is stable and unique per point.
+    public let id: String
+    /// Short name within its group, e.g. "Front left".
+    public let name: String
+    public let group: String
+    public let kind: Kind
+    /// Windows distinguish a third state; everything else is only open or closed.
+    public let opening: OpeningState?
+    public let isLocked: Bool?
+
+    public var isOpen: Bool? { opening?.isOpen }
+
+    /// What to show for this point's state, in words.
+    public var openingText: String {
+        switch opening {
+        case .closed: return "Closed"
+        case .ajar: return "Ajar"
+        case .open: return "Open"
+        case nil: return "—"
+        }
+    }
+
+    public var lockText: String? {
+        isLocked.map { $0 ? "Locked" : "Unlocked" }
+    }
+}
+
 /// BMW arms the alarm when the car is locked, so this is the closest thing to a lock
 /// state the catalogue offers — there is no central-locking descriptor.
 public enum AlarmArmState: Equatable, Sendable {
@@ -242,37 +368,126 @@ extension VehicleState {
 
     // MARK: Openings
 
+    /// Every body point, in display order, whether or not the car has reported it.
+    /// The single source of truth for the Body tile, its detail panel, and the
+    /// "left open" notification.
+    public var bodyOpenings: [BodyOpening] {
+        let corners = ["Front left", "Front right", "Rear left", "Rear right"]
+
+        var points = zip(Descriptor.doors, corners).map { id, name in
+            BodyOpening(
+                id: id,
+                name: name,
+                group: "Doors",
+                kind: .door,
+                // Doors report a plain boolean, so they can only be open or closed.
+                opening: self[id]?.boolValue.map { $0 ? .open : .closed },
+                isLocked: nil
+            )
+        }
+
+        points += zip(Descriptor.windows, corners).map { id, name in
+            BodyOpening(
+                id: id,
+                name: name,
+                group: "Windows",
+                kind: .window,
+                opening: self[id]?.stringValue.flatMap(OpeningState.init(raw:)),
+                isLocked: nil
+            )
+        }
+
+        // The tailgate glass opens independently of the boot lid on some models.
+        points.append(
+            BodyOpening(
+                id: Descriptor.rearWindowOpen,
+                name: "Tailgate glass",
+                group: "Windows",
+                kind: .window,
+                opening: openingState(Descriptor.rearWindowOpen),
+                isLocked: nil
+            )
+        )
+
+        points.append(
+            BodyOpening(
+                id: Descriptor.trunkOpen,
+                name: "Boot",
+                group: "Other",
+                kind: .boot,
+                opening: self[Descriptor.trunkOpen]?.boolValue.map { $0 ? .open : .closed },
+                // The only point where BMW reports both facts.
+                isLocked: self[Descriptor.trunkLocked]?.boolValue
+            )
+        )
+
+        points.append(
+            BodyOpening(
+                id: Descriptor.hoodOpen,
+                name: "Bonnet",
+                group: "Other",
+                kind: .bonnet,
+                opening: self[Descriptor.hoodOpen]?.boolValue.map { $0 ? .open : .closed },
+                isLocked: nil
+            )
+        )
+
+        points.append(
+            BodyOpening(
+                id: Descriptor.chargeFlapLocked,
+                name: "Charge flap",
+                group: "Other",
+                kind: .chargeFlap,
+                // No open/closed descriptor exists for the flap, only its lock.
+                opening: nil,
+                isLocked: self[Descriptor.chargeFlapLocked]?.boolValue
+            )
+        )
+
+        return points
+    }
+
+    /// Handles descriptors BMW sends as either a boolean or a CLOSED/OPEN string.
+    private func openingState(_ descriptor: String) -> OpeningState? {
+        guard let value = self[descriptor] else { return nil }
+        if let flag = value.boolValue, value.stringValue.flatMap(OpeningState.init(raw:)) == nil {
+            return flag ? .open : .closed
+        }
+        return value.stringValue.flatMap(OpeningState.init(raw:))
+    }
+
     public var openDoors: [String] {
-        Descriptor.doors.filter { self[$0]?.boolValue == true }
-            .map(Descriptor.label(for:))
+        bodyOpenings.filter { $0.kind == .door && $0.isOpen == true }
+            .map { Descriptor.label(for: $0.id) }
     }
 
     public var openWindows: [String] {
-        Descriptor.windows.filter {
-            self[$0]?.stringValue.flatMap(OpeningState.init(raw:))?.isOpen == true
-        }
-        .map(Descriptor.label(for:))
+        bodyOpenings.filter { $0.kind == .window && $0.isOpen == true }
+            .map { Descriptor.label(for: $0.id) }
     }
 
     public var isTrunkOpen: Bool? { self[Descriptor.trunkOpen]?.boolValue }
     public var isHoodOpen: Bool? { self[Descriptor.hoodOpen]?.boolValue }
 
-    /// Everything that could be left open, named. Empty means buttoned up; `nil`
-    /// entries simply never reported and are not guessed at.
+    /// Everything that could be left open, named. Empty means buttoned up; points the
+    /// car never reported are not guessed at.
     public var openThings: [String] {
-        var open = openDoors + openWindows
-        if isTrunkOpen == true { open.append(Descriptor.label(for: Descriptor.trunkOpen)) }
-        if isHoodOpen == true { open.append(Descriptor.label(for: Descriptor.hoodOpen)) }
-        if self[Descriptor.rearWindowOpen]?.stringValue.flatMap(OpeningState.init(raw:))?.isOpen == true {
-            open.append(Descriptor.label(for: Descriptor.rearWindowOpen))
-        }
-        return open
+        bodyOpenings.filter { $0.isOpen == true }.map { Descriptor.label(for: $0.id) }
+    }
+
+    /// Points that report a lock state at all — the boot and the charge flap.
+    public var lockableThings: [BodyOpening] {
+        bodyOpenings.filter { $0.isLocked != nil }
+    }
+
+    /// Anything that reports a lock and is currently unlocked.
+    public var unlockedThings: [BodyOpening] {
+        bodyOpenings.filter { $0.isLocked == false }
     }
 
     /// True only when at least one opening actually reported, and all of them are shut.
     public var isAllClosed: Bool? {
-        let reported = (Descriptor.doors + Descriptor.windows
-            + [Descriptor.trunkOpen, Descriptor.hoodOpen]).contains { self[$0] != nil }
+        let reported = bodyOpenings.contains { $0.opening != nil }
         return reported ? openThings.isEmpty : nil
     }
 

@@ -9,8 +9,9 @@ import Observation
 /// ever fed the REST snapshot endpoint — is never created. The last known state is
 /// restored from disk so the panel has content instantly, and the stream corrects it.
 ///
-/// The single remaining REST path is the user explicitly pressing "Fetch now", which
-/// is labelled with its cost.
+/// REST is reached two ways, both bounded: the user pressing "Fetch now", and an
+/// optional idle poll that fills the gaps when the car goes quiet (see `startPolling`).
+/// Both are labelled with their cost, and the poll spends only non-essential budget.
 @MainActor
 @Observable
 public final class AppModel {
@@ -51,7 +52,24 @@ public final class AppModel {
     /// Recent history for the sparkline, refreshed as samples are recorded.
     public private(set) var recentSamples: [Sample] = []
 
+    /// The charge to show, refreshed on a ticker so the estimate advances between the
+    /// car's reports.
+    ///
+    /// This lives on the model rather than in a `TimelineView` because a TimelineView
+    /// inside the `MenuBarExtra` *label* wedges SwiftUI in `updateButton` while it
+    /// builds the status item, blocking the main thread hard enough that
+    /// `applicationDidFinishLaunching` never returns and the app never starts.
+    public private(set) var displayChargePercent: Double?
+    public private(set) var isChargeEstimated = false
+
     public private(set) var notifications = NotificationPreferences.default
+    public private(set) var polling = PollingPreferences.default
+    /// When the stream last delivered anything, for deciding the car has gone quiet.
+    public private(set) var lastStreamMessageAt: Date?
+    public private(set) var lastAutoFetchAt: Date?
+    /// Set when an automatic poll was skipped for want of budget, so the panel can say
+    /// so quietly instead of raising it as a failure.
+    public private(set) var pollingBlockedReason: String?
     public private(set) var notifier = ChargingNotifier()
 
     private var session: Session?
@@ -59,9 +77,25 @@ public final class AppModel {
     private var pumpTask: Task<Void, Never>?
     private let stateStore = VehicleStateStore()
     private let sampleLog = SampleLog()
+    private var pollTask: Task<Void, Never>?
+    private var estimateTask: Task<Void, Never>?
+    private var saveTask: Task<Void, Never>?
+    /// Plenty for the 24 h sparkline and recent sessions, while keeping the in-memory
+    /// array bounded no matter how long the 90-day log grows.
+    nonisolated static let samplesKeptInMemory = 5_000
+
+    /// Keeps the in-memory window bounded however large the on-disk log grows.
+    nonisolated static func trimmed(_ samples: [Sample]) -> [Sample] {
+        samples.count > samplesKeptInMemory
+            ? Array(samples.suffix(samplesKeptInMemory))
+            : samples
+    }
+    private let launchedAt = Date()
 
     public init() {
-        notifications = Config.load().notificationPreferences
+        let config = Config.load()
+        notifications = config.notificationPreferences
+        polling = config.pollingPreferences
     }
 
     /// A ready-to-render model with synthetic state and no network, for rendering the
@@ -75,16 +109,20 @@ public final class AppModel {
         notifications = .default
         vehicle.vehicleName = vehicleName
         vehicle.merge(previewValues)
-        recentSamples = samples
+        recentSamples = Self.trimmed(samples)
         self.streamStatus = streamStatus
         quota = QuotaSnapshot(used: 36, limit: QuotaTracker.dailyLimit, resetsAt: Date().addingTimeInterval(3600))
         phase = .ready
+        displayChargePercent = vehicle.displayChargePercent()
+        isChargeEstimated = vehicle.isChargeEstimated()
     }
 
     // MARK: - Lifecycle
 
     public func start() async {
+        Log.app.notice("start")
         guard Config.resolvedClientID() != nil else {
+            Log.app.notice("no client id")
             phase = .needsClientID
             return
         }
@@ -93,12 +131,16 @@ public final class AppModel {
             self.session = session
 
             guard await session.tokens.hasCredentials() else {
+                Log.app.notice("no credentials")
                 phase = .needsAuthorization
                 return
             }
+            Log.app.notice("credentials ok, requesting notification authorisation")
             await notifier.requestAuthorizationIfNeeded(for: notifications)
+            Log.app.notice("notification authorisation done, connecting")
             try await connect(using: session)
         } catch {
+            Log.app.error("start failed: \(String(describing: error), privacy: .public)")
             phase = .failed(String(describing: error))
         }
     }
@@ -138,10 +180,14 @@ public final class AppModel {
         phase = .needsAuthorization
     }
 
-    /// The only REST path left, and only ever on an explicit press. Costs one call
-    /// from BMW's 50/day, and lazily creates the telemetry container it needs — which
-    /// is why the container is not made at startup.
-    public func refreshSnapshot() async {
+    /// Fetches one REST snapshot, costing a call from BMW's 50/day and lazily creating
+    /// the telemetry container if setup never ran.
+    ///
+    /// - Parameter automatic: a background idle poll rather than a press. Automatic
+    ///   fetches spend non-essential budget, so they stop at the reserve and can never
+    ///   consume the headroom a manual fetch relies on. Their failures are also
+    ///   reported quietly — a poll that can't run is not an error the user caused.
+    public func refreshSnapshot(automatic: Bool = false) async {
         guard let session else { return }
         isFetching = true
         defer { isFetching = false }
@@ -153,18 +199,126 @@ public final class AppModel {
 
             let snapshot = try await session.client.telematicData(
                 vin: setup.vin,
-                containerID: setup.containerID
+                containerID: setup.containerID,
+                essential: !automatic
             )
+            if automatic { lastAutoFetchAt = Date() }
+            Log.api.notice("snapshot: \(snapshot.count, privacy: .public) values, automatic=\(automatic, privacy: .public)")
             if !snapshot.isEmpty {
                 vehicle.merge(snapshot)
                 restoredFrom = nil
                 snapshotError = nil
+                pollingBlockedReason = nil
                 stateStore.save(vehicle.values)
+                // A snapshot counts as hearing from the car, so the idle clock restarts.
+                lastStreamMessageAt = Date()
             }
         } catch {
-            snapshotError = String(describing: error)
+            if automatic {
+                Log.polling.error("fetch failed: \(String(describing: error), privacy: .public)")
+                pollingBlockedReason = String(describing: error)
+                lastAutoFetchAt = Date()
+            } else {
+                snapshotError = String(describing: error)
+            }
         }
         quota = await session.client.quotaSnapshot()
+    }
+
+    /// Recomputes the displayed charge from the current time.
+    private func refreshEstimate(now: Date = Date()) {
+        displayChargePercent = vehicle.displayChargePercent(asOf: now)
+        isChargeEstimated = vehicle.isChargeEstimated(asOf: now)
+    }
+
+    /// Advances the estimate while the car is silent. Cheap: one wake every 30 s, and
+    /// only the two published values change.
+    private func startEstimateTicker() {
+        estimateTask?.cancel()
+        estimateTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 30_000_000_000)
+                guard !Task.isCancelled, let self else { return }
+                self.refreshEstimate()
+            }
+        }
+    }
+
+    // MARK: - Idle polling
+
+    public func updatePolling(_ preferences: PollingPreferences) {
+        polling = preferences
+        var config = Config.load()
+        config.pollingPreferences = preferences
+        try? config.save()
+        startPolling()
+    }
+
+    /// How long the car has been silent, for the settings screen.
+    public func streamIdleInterval(asOf now: Date = Date()) -> TimeInterval? {
+        guard let since = lastStreamMessageAt else { return nil }
+        return now.timeIntervalSince(since)
+    }
+
+    /// Watches for stream silence and fetches a snapshot to fill the gap.
+    ///
+    /// CarData publishes on events, not on a clock, so a charge can climb for half an
+    /// hour with nothing sent. This is the only thing in the app that spends BMW's
+    /// budget without a click, which is why it is a setting, is non-essential, and
+    /// refuses to run before setup has cached a container.
+    private func startPolling() {
+        pollTask?.cancel()
+        guard polling.enabled, polling.chargingIdleMinutes > 0 else {
+            pollTask = nil
+            Log.polling.notice("disabled")
+            return
+        }
+        Log.polling.notice("armed: fetch after \(self.polling.chargingIdleMinutes, privacy: .public) min of silence while charging")
+
+        pollTask = Task { [weak self] in
+            while !Task.isCancelled {
+                // Checking each minute keeps the decision responsive without the timer
+                // itself costing anything.
+                try? await Task.sleep(nanoseconds: 60_000_000_000)
+                guard !Task.isCancelled, let self else { return }
+                await self.pollIfIdle()
+            }
+        }
+    }
+
+    private func pollIfIdle(now: Date = Date()) async {
+        guard polling.enabled, phase == .ready, !isFetching else {
+            Log.polling.debug("tick skipped: enabled=\(self.polling.enabled, privacy: .public) ready=\(self.phase == .ready, privacy: .public) fetching=\(self.isFetching, privacy: .public)")
+            return
+        }
+        // Charging is the only time the number moves on its own, so it is the only time
+        // a fetch buys anything. A parked car polled all day would spend the whole
+        // budget to learn it is still parked.
+        guard vehicle.isCharging else {
+            Log.polling.debug("tick skipped: not charging")
+            return
+        }
+        // Never let a poll trigger first-time setup: that would spend ~3 calls the user
+        // never asked for.
+        guard Config.load().containerID != nil else {
+            Log.polling.debug("tick skipped: no container cached")
+            return
+        }
+
+        let idleSince = max(
+            lastStreamMessageAt ?? .distantPast,
+            lastAutoFetchAt ?? .distantPast
+        )
+        // Nothing heard at all yet: measure from launch rather than fetching instantly.
+        let reference = idleSince == .distantPast ? launchedAt : idleSince
+        let idle = now.timeIntervalSince(reference)
+        guard idle >= Double(polling.chargingIdleMinutes) * 60 else {
+            Log.polling.debug("tick: charging, idle \(Int(idle), privacy: .public)s of \(self.polling.chargingIdleMinutes * 60, privacy: .public)s")
+            return
+        }
+
+        Log.polling.notice("fetching after \(Int(idle), privacy: .public)s of silence while charging")
+        await refreshSnapshot(automatic: true)
     }
 
     /// The stream told us which car this is, so record it and never ask BMW.
@@ -209,10 +363,15 @@ public final class AppModel {
         notifier.process(vehicle, preferences: notifications)
 
         sampleLog.prune()
-        recentSamples = sampleLog.load()
+        recentSamples = Self.trimmed(sampleLog.load())
+
+        refreshEstimate()
+        startEstimateTicker()
 
         startStream(session: session, vin: config.vin)
         phase = .ready
+        Log.app.notice("ready: vin=\(config.vin != nil, privacy: .public) cached=\(self.vehicle.values.count, privacy: .public) values")
+        startPolling()
     }
 
     private func startStream(session: Session, vin: String?) {
@@ -220,6 +379,7 @@ public final class AppModel {
 
         let stream = CarDataStream(tokens: session.tokens, vin: vin)
         stream.onStatusChange = { [weak self] status in
+            Log.stream.notice("\(status.summary, privacy: .public)")
             Task { @MainActor in self?.streamStatus = status }
         }
         stream.onVINDiscovered = { [weak self] discovered in
@@ -241,6 +401,10 @@ public final class AppModel {
     private func apply(_ message: StreamMessage) {
         vehicle.merge(message.data)
         restoredFrom = nil
+        lastStreamMessageAt = Date()
+        pollingBlockedReason = nil
+        Log.stream.debug("message: \(message.data.count, privacy: .public) descriptor(s)")
+        refreshEstimate()
 
         // One detector drives both the banner and the matching on-screen pulse, so the
         // two can never disagree about what happened.
@@ -250,10 +414,25 @@ public final class AppModel {
         }
 
         // Local history is what makes BMW's REST chargingHistory endpoint unnecessary.
-        if sampleLog.record(Sample(vehicle)) {
-            recentSamples = sampleLog.load()
+        // Appending in memory rather than re-reading the file: `load()` parses every
+        // line, and doing that per message meant a burst re-parsed the whole 90-day log
+        // dozens of times in a second.
+        let sample = Sample(vehicle)
+        if sampleLog.record(sample) {
+            recentSamples = Self.trimmed(recentSamples + [sample])
         }
-        stateStore.save(vehicle.values)
+        scheduleStateSave()
+    }
+
+    /// The on-disk cache only needs to be current enough to survive a relaunch, so
+    /// writes are coalesced instead of encoding the whole state per message.
+    private func scheduleStateSave() {
+        saveTask?.cancel()
+        saveTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            guard !Task.isCancelled, let self else { return }
+            self.stateStore.save(self.vehicle.values)
+        }
     }
 
     /// Called by the view once a cue has been animated.
@@ -265,6 +444,14 @@ public final class AppModel {
     }
 
     private func stopStream() {
+        // A coalesced write may still be pending; do it now rather than lose it.
+        saveTask?.cancel()
+        saveTask = nil
+        if !vehicle.values.isEmpty { stateStore.save(vehicle.values) }
+        pollTask?.cancel()
+        pollTask = nil
+        estimateTask?.cancel()
+        estimateTask = nil
         pumpTask?.cancel()
         pumpTask = nil
         stream?.stop()

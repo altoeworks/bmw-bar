@@ -406,8 +406,15 @@ public enum DebugCLI {
             }
         }
 
+        let detail = value(of: "--detail", in: args)
+            .flatMap { DashboardDetail(rawValue: $0) }
+        if args.contains("--detail"), detail == nil {
+            let known = DashboardDetail.allCases.map(\.rawValue).joined(separator: ", ")
+            throw CLIError.notificationsUnavailable("unknown --detail; expected one of: \(known)")
+        }
+
         let model = AppModel(previewValues: values, samples: samples)
-        let renderer = ImageRenderer(content: StatusPanel(model: model)
+        let renderer = ImageRenderer(content: StatusPanel(model: model, initialDetail: detail)
             .background(Color(nsColor: .windowBackgroundColor)))
         renderer.scale = 2
         guard let image = renderer.nsImage,
@@ -509,7 +516,9 @@ public enum DebugCLI {
           stream [--json] [--seconds <n>]     Follow the live MQTT feed (no quota cost)
           notify-test                         Post a sample notification (bundled app only)
           mood [state]                        Show the colour + motion for each state
-          render [--charging|--empty] out.png Render the panel to an image (no network)
+          render [--charging|--empty]         Render the panel to an image (no network)
+                 [--detail <name>] out.png    …or one detail panel: body, tyres, charging,
+                                              security, location, climate, trip
           quota                               Show today's API budget (offline)
           containers [--delete <id>]          List or remove telemetry containers
           signout                             Delete stored credentials
